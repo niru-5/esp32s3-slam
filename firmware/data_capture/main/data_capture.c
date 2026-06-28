@@ -4,12 +4,23 @@
 #include "esp_event.h"
 #include "nvs_flash.h"
 #include "esp_http_server.h"
+#include "esp_timer.h"
 #include "driver/i2c.h"
+#include "driver/gpio.h"
 #include "mdns.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include <string.h>
+
+#include "bmi270.h"
 
 #define WIFI_SSID "Jarvis_slow"
 #define WIFI_PASS "Someoneisusingmydata"
 
+// --------------------------------------------------------------------------
+// Camera pins (OV5640)
+// --------------------------------------------------------------------------
 #define PWDN_GPIO_NUM  -1
 #define RESET_GPIO_NUM -1
 #define XCLK_GPIO_NUM  15
@@ -27,93 +38,314 @@
 #define HREF_GPIO_NUM   7
 #define PCLK_GPIO_NUM  13
 
-static const char *TAG = "CAM";
+// --------------------------------------------------------------------------
+// BMI270 — I2C_NUM_1 (I2C_NUM_0 is reserved for camera SCCB on GPIO 4/5)
+// Wire BMI270: SDA→GPIO38, SCL→GPIO39, SDO→GND (addr 0x68), CSB→VDD
+// --------------------------------------------------------------------------
+#define IMU_I2C_PORT   I2C_NUM_0
+#define IMU_SDA_GPIO   38
+#define IMU_SCL_GPIO   39
+#define IMU_I2C_FREQ   400000
+#define BMI270_ADDR    BMI2_I2C_PRIM_ADDR  // 0x68 when SDO=GND
+#define IMU_CSB_GPIO   40                   // driven HIGH to select I2C mode on BMI270
 
-// Convert grayscale buffer to BMP and serve it
-// static esp_err_t capture_handler(httpd_req_t *req) {
-//     camera_fb_t *fb = esp_camera_fb_get();
-//     if (!fb) {
-//         ESP_LOGE(TAG, "Frame capture failed");
-//         httpd_resp_send_500(req);
-//         return ESP_FAIL;
-//     }
+// BMI2_SENSORTIME_RESOLUTION = 0.0000390625 s/tick = 39.0625 µs/tick
+// Host converts: sample_esp_us = ref_esp_us + (sens_time - ref_ticks) * 39.0625
 
-//     // BMP header for 320x240 grayscale
-//     int w = fb->width, h = fb->height;
-//     int row_size = (w + 3) & ~3;  // padded to 4 bytes
-//     int pixel_data_size = row_size * h;
-//     int file_size = 54 + 1024 + pixel_data_size;  // header + palette + pixels
+// --------------------------------------------------------------------------
+// IMU ring buffer — 2 s at 100 Hz
+// --------------------------------------------------------------------------
+#define IMU_RING_CAP  200
 
-//     uint8_t *bmp = malloc(file_size);
-//     if (!bmp) {
-//         esp_camera_fb_return(fb);
-//         httpd_resp_send_500(req);
-//         return ESP_FAIL;
-//     }
-//     memset(bmp, 0, file_size);
+typedef struct {
+    uint32_t sens_time;        // raw BMI270 24-bit sensor clock ticks
+    float    ax, ay, az;       // accelerometer (g)
+    float    gx, gy, gz;       // gyroscope (deg/s)
+} imu_sample_t;
 
-//     // BMP file header
-//     bmp[0]='B'; bmp[1]='M';
-//     *(uint32_t*)(bmp+2)  = file_size;
-//     *(uint32_t*)(bmp+10) = 54 + 1024;  // pixel data offset
+static imu_sample_t      s_imu_ring[IMU_RING_CAP];
+static uint32_t          s_imu_write = 0;   // index of next write slot
+static uint32_t          s_imu_count = 0;   // valid samples in ring
+static SemaphoreHandle_t s_imu_mutex;
 
-//     // DIB header
-//     *(uint32_t*)(bmp+14) = 40;   // header size
-//     *(int32_t*) (bmp+18) = w;
-//     *(int32_t*) (bmp+22) = -h;   // negative = top-down
-//     *(uint16_t*)(bmp+26) = 1;    // color planes
-//     *(uint16_t*)(bmp+28) = 8;    // bits per pixel
-//     *(uint32_t*)(bmp+34) = pixel_data_size;
+static struct bmi2_dev   s_bmi2;
+static float             s_raw_to_gs;       // int16 → g
+static float             s_raw_to_dps;      // int16 → deg/s
 
-//     // Grayscale palette (256 entries)
-//     for (int i = 0; i < 256; i++) {
-//         bmp[54 + i*4 + 0] = i;
-//         bmp[54 + i*4 + 1] = i;
-//         bmp[54 + i*4 + 2] = i;
-//         bmp[54 + i*4 + 3] = 0;
-//     }
+static const char *TAG = "SLAM";
 
-//     // Pixel data (copy rows with padding)
-//     uint8_t *pixels = bmp + 54 + 1024;
-//     for (int y = 0; y < h; y++) {
-//         memcpy(pixels + y * row_size, fb->buf + y * w, w);
-//     }
+// --------------------------------------------------------------------------
+// BMI2 I2C read/write callbacks
+// --------------------------------------------------------------------------
 
-//     esp_camera_fb_return(fb);
+static BMI2_INTF_RETURN_TYPE bmi2_i2c_read(uint8_t reg_addr, uint8_t *data,
+                                             uint32_t len, void *intf_ptr) {
+    if (len == 0) return BMI2_E_COM_FAIL;
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (BMI270_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, reg_addr, true);
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (BMI270_ADDR << 1) | I2C_MASTER_READ, true);
+    if (len > 1)
+        i2c_master_read(cmd, data, len - 1, I2C_MASTER_ACK);
+    i2c_master_read_byte(cmd, data + len - 1, I2C_MASTER_NACK);
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(IMU_I2C_PORT, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+    return (ret == ESP_OK) ? BMI2_OK : BMI2_E_COM_FAIL;
+}
 
-//     httpd_resp_set_type(req, "image/bmp");
-//     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
-//     esp_err_t res = httpd_resp_send(req, (char*)bmp, file_size);
-//     free(bmp);
-//     return res;
-// }
+static BMI2_INTF_RETURN_TYPE bmi2_i2c_write(uint8_t reg_addr, const uint8_t *data,
+                                              uint32_t len, void *intf_ptr) {
+    if (len == 0) return BMI2_E_COM_FAIL;
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (BMI270_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, reg_addr, true);
+    i2c_master_write(cmd, (uint8_t *)data, len, true);
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(IMU_I2C_PORT, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+    return (ret == ESP_OK) ? BMI2_OK : BMI2_E_COM_FAIL;
+}
+
+static void bmi2_delay_us_cb(uint32_t period, void *intf_ptr) {
+    if (period >= 1000) {
+        vTaskDelay(pdMS_TO_TICKS((period + 999) / 1000));
+    } else {
+        int64_t end = esp_timer_get_time() + period;
+        while (esp_timer_get_time() < end) {}
+    }
+}
+
+// --------------------------------------------------------------------------
+// IMU init
+// --------------------------------------------------------------------------
+
+static esp_err_t imu_init(void) {
+    // Pull CSB high to put BMI270 in I2C mode before any communication
+    gpio_config_t csb = {
+        .pin_bit_mask = 1ULL << IMU_CSB_GPIO,
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&csb);
+    gpio_set_level(IMU_CSB_GPIO, 1);
+    vTaskDelay(pdMS_TO_TICKS(5)); // let BMI270 settle into I2C mode
+
+    i2c_config_t cfg = {
+        .mode             = I2C_MODE_MASTER,
+        .sda_io_num       = IMU_SDA_GPIO,
+        .scl_io_num       = IMU_SCL_GPIO,
+        .sda_pullup_en    = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en    = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = IMU_I2C_FREQ,
+    };
+    ESP_ERROR_CHECK(i2c_param_config(IMU_I2C_PORT, &cfg));
+    ESP_ERROR_CHECK(i2c_driver_install(IMU_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0));
+
+    s_bmi2.read           = bmi2_i2c_read;
+    s_bmi2.write          = bmi2_i2c_write;
+    s_bmi2.delay_us       = bmi2_delay_us_cb;
+    s_bmi2.intf_ptr       = NULL;
+    s_bmi2.intf           = BMI2_I2C_INTF;
+    s_bmi2.read_write_len = 32;
+
+    int8_t err = bmi270_init(&s_bmi2);
+    if (err != BMI2_OK) {
+        ESP_LOGE(TAG, "bmi270_init failed: %d", err);
+        return ESP_FAIL;
+    }
+
+    uint8_t sens_list[] = {BMI2_ACCEL, BMI2_GYRO};
+    err = bmi270_sensor_enable(sens_list, 2, &s_bmi2);
+    if (err != BMI2_OK) {
+        ESP_LOGE(TAG, "sensor_enable failed: %d", err);
+        return ESP_FAIL;
+    }
+
+    // Read defaults then override non-default values only
+    struct bmi2_sens_config config[2];
+    config[0].type = BMI2_ACCEL;
+    config[1].type = BMI2_GYRO;
+    err = bmi270_get_sensor_config(config, 2, &s_bmi2);
+    if (err != BMI2_OK) {
+        ESP_LOGE(TAG, "get_sensor_config failed: %d", err);
+        return ESP_FAIL;
+    }
+
+    config[0].cfg.acc.odr   = BMI2_ACC_ODR_100HZ;
+    config[0].cfg.acc.range = BMI2_ACC_RANGE_4G;
+
+    config[1].cfg.gyr.odr   = BMI2_GYR_ODR_100HZ;
+    config[1].cfg.gyr.range = BMI2_GYR_RANGE_500;
+
+    err = bmi270_set_sensor_config(config, 2, &s_bmi2);
+    if (err != BMI2_OK) {
+        ESP_LOGE(TAG, "set_sensor_config failed: %d", err);
+        return ESP_FAIL;
+    }
+
+    // Conversion scalars — must be computed from the ranges we just set
+    // accel: raw int16 * scalar → g
+    s_raw_to_gs  = (float)(2 << config[0].cfg.acc.range) / 32768.0f;
+    // gyro: raw int16 * scalar → deg/s  (BMI2_GYR_RANGE_125 = 4)
+    s_raw_to_dps = (125.0f * (float)(1 << (BMI2_GYR_RANGE_125 - config[1].cfg.gyr.range))) / 32768.0f;
+
+    ESP_LOGI(TAG, "BMI270 ready — accel ±%dG  gyro ±%ddps  ODR 100Hz",
+             (int)(2 << config[0].cfg.acc.range),
+             (int)(125 * (1 << (BMI2_GYR_RANGE_125 - config[1].cfg.gyr.range))));
+    return ESP_OK;
+}
+
+// --------------------------------------------------------------------------
+// IMU task — 100 Hz
+// Stores raw sensor timestamp per sample; host applies clock offset at read.
+// NOTE: for reliable 10 ms tick, set CONFIG_FREERTOS_HZ=1000 in sdkconfig.
+// --------------------------------------------------------------------------
+
+static void imu_task(void *arg) {
+    TickType_t last_wake = xTaskGetTickCount();
+    while (1) {
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(10));
+
+        struct bmi2_sens_data raw;
+        memset(&raw, 0, sizeof(raw));
+        if (bmi2_get_sensor_data(&raw, &s_bmi2) != BMI2_OK) continue;
+
+        imu_sample_t s = {
+            .sens_time = raw.sens_time,
+            .ax = (float)raw.acc.x * s_raw_to_gs,
+            .ay = (float)raw.acc.y * s_raw_to_gs,
+            .az = (float)raw.acc.z * s_raw_to_gs,
+            .gx = (float)raw.gyr.x * s_raw_to_dps,
+            .gy = (float)raw.gyr.y * s_raw_to_dps,
+            .gz = (float)raw.gyr.z * s_raw_to_dps,
+        };
+
+        xSemaphoreTake(s_imu_mutex, portMAX_DELAY);
+        s_imu_ring[s_imu_write] = s;
+        s_imu_write = (s_imu_write + 1) % IMU_RING_CAP;
+        if (s_imu_count < IMU_RING_CAP) s_imu_count++;
+        xSemaphoreGive(s_imu_mutex);
+    }
+}
+
+// --------------------------------------------------------------------------
+// HTTP handlers
+// --------------------------------------------------------------------------
 
 static esp_err_t capture_handler(httpd_req_t *req) {
+    // Timestamp at frame grab — consistent reference for the IMU clock offset
+    int64_t ts = esp_timer_get_time();
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
+    char ts_str[24];
+    snprintf(ts_str, sizeof(ts_str), "%lld", ts);
     httpd_resp_set_type(req, "image/jpeg");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
-    esp_err_t res = httpd_resp_send(req, (char*)fb->buf, fb->len);
+    httpd_resp_set_hdr(req, "X-Timestamp-Us", ts_str);
+    esp_err_t res = httpd_resp_send(req, (char *)fb->buf, fb->len);
     esp_camera_fb_return(fb);
     return res;
 }
 
-// Mjpeg-style streaming page
+// /imu — binary response
+//
+// Header (16 bytes, little-endian):
+//   uint32  num_samples
+//   int64   ref_esp_us        — ESP32 µs-since-boot at response time
+//   uint32  ref_sensor_ticks  — BMI270 tick at response time
+//
+// Per sample (28 bytes):
+//   uint32  sens_time          — BMI270 tick when sample was polled
+//   float   ax, ay, az         — g
+//   float   gx, gy, gz         — deg/s
+//
+// Host converts to ESP32 time:
+//   sample_esp_us = ref_esp_us + (int64)(sens_time - ref_sensor_ticks) * 39.0625
+//
+// Sensor clock wraps at 2^24 ticks ≈ 655 s; safe for a 2 s ring buffer.
+static esp_err_t imu_handler(httpd_req_t *req) {
+    // Snapshot ring and clear it
+    xSemaphoreTake(s_imu_mutex, portMAX_DELAY);
+    uint32_t count  = s_imu_count;
+    uint32_t oldest = (s_imu_write + IMU_RING_CAP - count) % IMU_RING_CAP;
+
+    imu_sample_t *snap = NULL;
+    if (count > 0) {
+        snap = malloc(count * sizeof(imu_sample_t));
+        if (!snap) {
+            s_imu_count = 0;
+            s_imu_write = 0;
+            xSemaphoreGive(s_imu_mutex);
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
+        }
+        for (uint32_t i = 0; i < count; i++)
+            snap[i] = s_imu_ring[(oldest + i) % IMU_RING_CAP];
+    }
+    s_imu_count = 0;
+    s_imu_write = 0;
+    xSemaphoreGive(s_imu_mutex);
+
+    // Reference pair — taken right after clearing so offset applies to snapshotted samples
+    struct bmi2_sens_data ref;
+    memset(&ref, 0, sizeof(ref));
+    bmi2_get_sensor_data(&ref, &s_bmi2);
+    int64_t  ref_esp_us        = esp_timer_get_time();
+    uint32_t ref_sensor_ticks  = ref.sens_time;
+
+    // Build binary payload
+    size_t body_len = 16 + (size_t)count * 28;
+    uint8_t *body = malloc(body_len);
+    if (!body) {
+        free(snap);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    uint8_t *p = body;
+    memcpy(p, &count,            4); p += 4;
+    memcpy(p, &ref_esp_us,       8); p += 8;
+    memcpy(p, &ref_sensor_ticks, 4); p += 4;
+    for (uint32_t i = 0; i < count; i++) {
+        memcpy(p, &snap[i].sens_time, 4); p += 4;
+        memcpy(p, &snap[i].ax,        4); p += 4;
+        memcpy(p, &snap[i].ay,        4); p += 4;
+        memcpy(p, &snap[i].az,        4); p += 4;
+        memcpy(p, &snap[i].gx,        4); p += 4;
+        memcpy(p, &snap[i].gy,        4); p += 4;
+        memcpy(p, &snap[i].gz,        4); p += 4;
+    }
+    free(snap);
+
+    httpd_resp_set_type(req, "application/octet-stream");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    esp_err_t res = httpd_resp_send(req, (char *)body, (ssize_t)body_len);
+    free(body);
+    return res;
+}
+
 static esp_err_t index_handler(httpd_req_t *req) {
     const char *html =
-    "<html><body style='background:#000;text-align:center'>"
-    "<h2 style='color:#fff'>ESP32-S3 Camera</h2>"
+    "<html><body style='background:#000;color:#fff;font-family:sans-serif'>"
+    "<h2>ESP32-S3 SLAM Camera</h2>"
     "<img id='img' style='width:640px'>"
+    "<p>IMU binary stream: <code>GET /imu</code></p>"
     "<script>"
-    "var img = document.getElementById('img');"
-    "function next() {"
-    "  var i = new Image();"
-    "  i.onload = function(){ img.src=this.src; setTimeout(next,100); };"
-    "  i.onerror = function(){ setTimeout(next,500); };"  // back off on error
-    "  i.src = '/capture?t=' + Date.now();"
+    "var img=document.getElementById('img');"
+    "function next(){"
+    "  var i=new Image();"
+    "  i.onload=function(){img.src=this.src;setTimeout(next,100);};"
+    "  i.onerror=function(){setTimeout(next,500);};"
+    "  i.src='/capture?t='+Date.now();"
     "}"
     "next();"
     "</script>"
@@ -122,20 +354,28 @@ static esp_err_t index_handler(httpd_req_t *req) {
     return httpd_resp_send(req, html, strlen(html));
 }
 
+// --------------------------------------------------------------------------
+// WiFi
+// --------------------------------------------------------------------------
+
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                 int32_t id, void *data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED)
         esp_wifi_connect();
     else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *e = (ip_event_got_ip_t*)data;
+        ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "IP: " IPSTR, IP2STR(&e->ip_info.ip));
-        ESP_LOGI(TAG, "Open http://" IPSTR " or http://turtle-camera.local in browser", IP2STR(&e->ip_info.ip));
+        ESP_LOGI(TAG, "http://" IPSTR "  or  http://slam-cam.local", IP2STR(&e->ip_info.ip));
         mdns_init();
-        mdns_hostname_set("turtle-camera");
-        mdns_instance_name_set("ESP32-S3 Camera");
+        mdns_hostname_set("slam-cam");
+        mdns_instance_name_set("ESP32-S3 SLAM Camera");
         mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
     }
 }
+
+// --------------------------------------------------------------------------
+// Entry point
+// --------------------------------------------------------------------------
 
 void app_main(void) {
     nvs_flash_init();
@@ -145,22 +385,19 @@ void app_main(void) {
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&cfg);
-    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
-    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL);
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,  wifi_event_handler, NULL);
+    esp_event_handler_register(IP_EVENT,   IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL);
 
     wifi_config_t wifi_cfg = {
-        .sta = {
-            .ssid     = WIFI_SSID,
-            .password = WIFI_PASS,
-        },
+        .sta = { .ssid = WIFI_SSID, .password = WIFI_PASS },
     };
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
     esp_wifi_start();
     esp_wifi_connect();
 
-    // Camera init
-    camera_config_t config = {
+    // Camera
+    camera_config_t cam_cfg = {
         .pin_pwdn     = PWDN_GPIO_NUM,
         .pin_reset    = RESET_GPIO_NUM,
         .pin_xclk     = XCLK_GPIO_NUM,
@@ -176,34 +413,42 @@ void app_main(void) {
         .xclk_freq_hz = 10000000,
         .ledc_timer   = LEDC_TIMER_0,
         .ledc_channel = LEDC_CHANNEL_0,
-        .pixel_format = PIXFORMAT_JPEG, //  PIXFORMAT_GRAYSCALE PIXFORMAT_JPEG
-        .frame_size   = FRAMESIZE_VGA, // FRAMESIZE_VGA  FRAMESIZE_QVGA
+        .pixel_format = PIXFORMAT_JPEG,
+        .frame_size   = FRAMESIZE_VGA,
         .jpeg_quality = 12,
         .fb_count     = 1,
         .fb_location  = CAMERA_FB_IN_DRAM,
         .grab_mode    = CAMERA_GRAB_WHEN_EMPTY,
     };
-
-    esp_err_t err = esp_camera_init(&config);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Camera init failed: 0x%x", err);
+    if (esp_camera_init(&cam_cfg) != ESP_OK) {
+        ESP_LOGE(TAG, "Camera init failed");
         return;
     }
 
-    sensor_t *s = esp_camera_sensor_get();
-    s->set_pixformat(s, PIXFORMAT_JPEG); // PIXFORMAT_JPEG
-    s->set_framesize(s, FRAMESIZE_VGA);
-    s->set_quality(s, 12);
+    // IMU
+    s_imu_mutex = xSemaphoreCreateMutex();
+    if (imu_init() != ESP_OK) {
+        ESP_LOGE(TAG, "IMU init failed — check wiring (SDA=GPIO%d SCL=GPIO%d addr=0x%02X)",
+                 IMU_SDA_GPIO, IMU_SCL_GPIO, BMI270_ADDR);
+        return;
+    }
 
     // HTTP server
     httpd_handle_t server = NULL;
-    httpd_config_t server_cfg = HTTPD_DEFAULT_CONFIG();
-    httpd_start(&server, &server_cfg);
+    httpd_config_t srv_cfg = HTTPD_DEFAULT_CONFIG();
+    srv_cfg.max_uri_handlers = 8;
+    httpd_start(&server, &srv_cfg);
 
-    httpd_uri_t index_uri = { .uri="/",        .method=HTTP_GET, .handler=index_handler };
-    httpd_uri_t cap_uri   = { .uri="/capture", .method=HTTP_GET, .handler=capture_handler };
-    httpd_register_uri_handler(server, &index_uri);
-    httpd_register_uri_handler(server, &cap_uri);
+    httpd_uri_t uris[] = {
+        { .uri = "/",        .method = HTTP_GET, .handler = index_handler   },
+        { .uri = "/capture", .method = HTTP_GET, .handler = capture_handler },
+        { .uri = "/imu",     .method = HTTP_GET, .handler = imu_handler     },
+    };
+    for (int i = 0; i < 3; i++)
+        httpd_register_uri_handler(server, &uris[i]);
 
     ESP_LOGI(TAG, "HTTP server started");
+
+    // IMU task pinned to core 1 so camera/WiFi (core 0) stays uncontended
+    xTaskCreatePinnedToCore(imu_task, "imu", 4096, NULL, 5, NULL, 1);
 }
