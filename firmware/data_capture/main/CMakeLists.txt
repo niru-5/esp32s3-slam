@@ -3,6 +3,10 @@ set(BMI_API "${CMAKE_CURRENT_SOURCE_DIR}/../../../SparkFun_BMI270_Arduino_Librar
 idf_component_register(
     SRCS
         "data_capture.c"
+        "camera.c"
+        "imu.c"
+        "server_local.c"
+        "net_client.c"
         "${BMI_API}/bmi2.c"
         "${BMI_API}/bmi270.c"
     INCLUDE_DIRS
