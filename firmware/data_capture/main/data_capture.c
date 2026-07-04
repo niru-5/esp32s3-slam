@@ -7,6 +7,7 @@
 #include "config.h"
 #include "camera.h"
 #include "imu.h"
+#include "sysstats.h"
 #include "server_local.h"
 #include "net_client.h"
 
@@ -63,6 +64,7 @@ void app_main(void) {
 
     if (camera_start() != ESP_OK) return;
     if (imu_start() != ESP_OK) return;
+    sysstats_start();  // best-effort telemetry; failure is non-fatal
 
 #if CONFIG_ENABLE_LOCAL_SERVER
     server_local_start();

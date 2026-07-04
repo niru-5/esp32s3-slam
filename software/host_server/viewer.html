@@ -32,6 +32,17 @@
   .stat { display: flex; justify-content: space-between; padding: 4px 0; }
   .stat b { font-variant-numeric: tabular-nums; }
   .muted { color: #6b7178; font-size: 12px; }
+  .load { margin: 6px 0; }
+  .load .lbl { display: flex; justify-content: space-between; font-size: 12px;
+               color: #9aa0a6; margin-bottom: 3px; }
+  .load .lbl b { color: #e6e8eb; font-variant-numeric: tabular-nums; }
+  .bar { height: 6px; background: #23262b; border-radius: 3px; overflow: hidden; }
+  .bar > span { display: block; height: 100%; width: 0;
+                background: #4c9aff; transition: width .2s, background .2s; }
+  .mem { font-variant-numeric: tabular-nums; }
+  .mem .track { height: 6px; background: #23262b; border-radius: 3px;
+                overflow: hidden; margin: 3px 0 8px; }
+  .mem .track > span { display: block; height: 100%; width: 0; background: #63d2a3; }
 </style>
 </head>
 <body>
@@ -61,10 +72,74 @@
         <tr><td class="k">esp_us</td><td class="v" id="esp_us" colspan="3">–</td></tr>
       </table>
     </div>
+    <div class="panel" style="margin-top:16px">
+      <h2>ESP32-S3 system</h2>
+      <div class="load">
+        <div class="lbl"><span>CPU core 0</span><b id="cpu0">–</b></div>
+        <div class="bar"><span id="cpu0bar"></span></div>
+      </div>
+      <div class="load">
+        <div class="lbl"><span>CPU core 1</span><b id="cpu1">–</b></div>
+        <div class="bar"><span id="cpu1bar"></span></div>
+      </div>
+      <div class="stat"><span>Chip temp</span><b><span id="temp">–</span> °C</b></div>
+      <div class="stat"><span>WiFi RSSI</span><b><span id="rssi">–</span> dBm</b></div>
+      <div class="stat"><span>Device uptime</span><b><span id="dev_uptime">–</span> s</b></div>
+      <div class="stat"><span>Heap free</span><b id="heap_free">–</b></div>
+      <div class="stat"><span>Heap min free</span><b id="heap_min">–</b></div>
+      <div class="mem" style="margin-top:10px">
+        <div class="lbl" style="display:flex;justify-content:space-between;font-size:12px;color:#9aa0a6">
+          <span>Internal DRAM</span><b id="int_txt" style="color:#e6e8eb">–</b></div>
+        <div class="track"><span id="int_bar"></span></div>
+        <div class="muted" style="margin-top:-4px">largest free block: <span id="int_largest">–</span></div>
+      </div>
+      <div class="mem" style="margin-top:10px">
+        <div class="lbl" style="display:flex;justify-content:space-between;font-size:12px;color:#9aa0a6">
+          <span>PSRAM (SPIRAM)</span><b id="psram_txt" style="color:#e6e8eb">–</b></div>
+        <div class="track"><span id="psram_bar"></span></div>
+        <div class="muted" style="margin-top:-4px">min free: <span id="psram_min">–</span> · largest: <span id="psram_largest">–</span></div>
+      </div>
+    </div>
   </div>
 </main>
 <script>
 function f(x, d) { return (x === undefined || x === null) ? "–" : Number(x).toFixed(d); }
+function kib(n) {
+  if (n === undefined || n === null) return "–";
+  if (n >= 1024 * 1024) return (n / 1048576).toFixed(2) + " MiB";
+  return (n / 1024).toFixed(1) + " KiB";
+}
+function loadColor(pct) {
+  return pct >= 85 ? "#ff6b6b" : pct >= 60 ? "#ffb454" : "#4c9aff";
+}
+function setCpu(pctId, barId, pct) {
+  const p = Math.max(0, Math.min(100, pct));
+  document.getElementById(pctId).textContent = p.toFixed(1) + " %";
+  const bar = document.getElementById(barId);
+  bar.style.width = p + "%";
+  bar.style.background = loadColor(p);
+}
+function setMem(txtId, barId, free, total) {
+  const used = total - free;
+  document.getElementById(txtId).textContent = kib(used) + " / " + kib(total);
+  const pct = total > 0 ? (100 * used / total) : 0;
+  document.getElementById(barId).style.width = pct + "%";
+}
+function updateStats(s) {
+  if (!s) return;
+  setCpu("cpu0", "cpu0bar", s.cpu0_load);
+  setCpu("cpu1", "cpu1bar", s.cpu1_load);
+  document.getElementById("temp").textContent = f(s.chip_temp_c, 1);
+  document.getElementById("rssi").textContent = s.wifi_rssi;
+  document.getElementById("dev_uptime").textContent = s.device_uptime_s;
+  document.getElementById("heap_free").textContent = kib(s.heap_free);
+  document.getElementById("heap_min").textContent = kib(s.heap_min_free);
+  setMem("int_txt", "int_bar", s.internal_free, s.internal_total);
+  document.getElementById("int_largest").textContent = kib(s.internal_largest);
+  setMem("psram_txt", "psram_bar", s.psram_free, s.psram_total);
+  document.getElementById("psram_min").textContent = kib(s.psram_min_free);
+  document.getElementById("psram_largest").textContent = kib(s.psram_largest);
+}
 async function poll() {
   try {
     const r = await fetch("/imu.json", { cache: "no-store" });
@@ -87,6 +162,7 @@ async function poll() {
       document.getElementById("gz").textContent = f(j.imu.gyro_dps.z, 2);
       document.getElementById("esp_us").textContent = j.imu.esp_us;
     }
+    updateStats(j.stats);
   } catch (e) { /* server momentarily busy */ }
 }
 setInterval(poll, 200);

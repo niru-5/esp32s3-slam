@@ -4,13 +4,22 @@
 #include <string.h>
 #include "esp_log.h"
 #include "esp_http_client.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "config.h"
 #include "camera.h"
 #include "imu.h"
+#include "sysstats.h"
 
 static const char *TAG = "NET";
+
+// How often to push a system-stats snapshot (Hz). Kept independent of the
+// frame rate so telemetry cadence is steady even if fps changes.
+#ifndef CONFIG_REMOTE_STATS_HZ
+#define CONFIG_REMOTE_STATS_HZ 1
+#endif
 
 typedef struct {
     char     host[64];
@@ -64,6 +73,10 @@ static void stream_task(void *arg) {
     ESP_LOGI(TAG, "streaming to http://%s:%u at %d fps",
              cfg->host, (unsigned)cfg->port, cfg->fps);
 
+    uint8_t stats_buf[SYSSTATS_WIRE_LEN];
+    const int64_t stats_period_us = 1000000 / (CONFIG_REMOTE_STATS_HZ > 0 ? CONFIG_REMOTE_STATS_HZ : 1);
+    int64_t last_stats_us = 0;
+
     TickType_t last_wake = xTaskGetTickCount();
     while (1) {
         vTaskDelayUntil(&last_wake, period);
@@ -79,6 +92,14 @@ static void stream_task(void *arg) {
         // IMU drain since last cycle.
         size_t imu_len = imu_serialize(imu_buf);
         post_bytes(cfg, "/imu", "application/octet-stream", imu_buf, imu_len, -1);
+
+        // System stats snapshot, throttled to CONFIG_REMOTE_STATS_HZ.
+        int64_t now = esp_timer_get_time();
+        if (now - last_stats_us >= stats_period_us) {
+            last_stats_us = now;
+            size_t stats_len = sysstats_serialize(stats_buf);
+            post_bytes(cfg, "/stats", "application/octet-stream", stats_buf, stats_len, -1);
+        }
     }
 }
 

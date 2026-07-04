@@ -5,6 +5,7 @@ idf_component_register(
         "data_capture.c"
         "camera.c"
         "imu.c"
+        "sysstats.c"
         "server_local.c"
         "net_client.c"
         "${BMI_API}/bmi2.c"

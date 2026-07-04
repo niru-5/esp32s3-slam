@@ -28,3 +28,7 @@
 
 // Frame push rate for the remote stream (Hz). IMU is drained each cycle.
 #define CONFIG_REMOTE_STREAM_FPS 3
+
+// System-stats (CPU load / heap / temperature) push rate (Hz). Kept low so the
+// telemetry adds negligible compute over the camera + IMU streaming.
+#define CONFIG_REMOTE_STATS_HZ 1

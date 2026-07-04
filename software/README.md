@@ -57,6 +57,7 @@ Ingest (called by the firmware):
 |---------------|------|-------|
 | `POST /frame` | JPEG | `X-Timestamp-Us` header = esp_timer µs at grab. |
 | `POST /imu`   | binary IMU drain | Format in [`host_server/wire.py`](host_server/wire.py), matches firmware `imu.h`. |
+| `POST /stats` | binary system snapshot | Per-core CPU load, heap/PSRAM, chip temp, RSSI. Format in [`host_server/wire.py`](host_server/wire.py), matches firmware `sysstats.h`. |
 
 Browser:
 
@@ -64,7 +65,7 @@ Browser:
 |---------------|---------|
 | `GET /`            | Live viewer page. |
 | `GET /stream.mjpg` | MJPEG stream of the latest frames. |
-| `GET /imu.json`    | Latest IMU sample + running stats (polled by the page). |
+| `GET /imu.json`    | Latest IMU sample, ESP32-S3 system stats + running counters (polled by the page). |
 
 ## Recorded topics
 
@@ -72,6 +73,7 @@ Browser:
 |-------|------|-------|
 | `/camera/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | JPEG (`format: "jpeg"`) |
 | `/imu/data` | `sensor_msgs/msg/Imu` | accel m/s², gyro rad/s (converted from g / deg-s; no orientation) |
+| `/esp32/diagnostics` | `diagnostic_msgs/msg/DiagnosticArray` | per-core CPU load %, heap/PSRAM bytes, chip temp °C, RSSI dBm (as `KeyValue`s) |
 
 Inspect / replay with the usual tooling:
 
@@ -86,9 +88,9 @@ ros2 bag play bags/slam_<timestamp>
 host_server/
   __main__.py     CLI entry point (python3 -m host_server)
   server.py       threaded http.server: ingest + live view
-  wire.py         decode the firmware's binary IMU payload + timestamps
-  bag_recorder.py rosbag2 writer (CompressedImage + Imu)
-  hub.py          shared latest-frame / latest-IMU state + counters
+  wire.py         decode the firmware's binary IMU + system-stats payloads
+  bag_recorder.py rosbag2 writer (CompressedImage + Imu + DiagnosticArray)
+  hub.py          shared latest-frame / latest-IMU / latest-stats state + counters
   viewer.html     browser page
 ```
 
