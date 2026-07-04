@@ -21,7 +21,7 @@ from pathlib import Path
 
 from .bag_recorder import BagRecorder
 from .hub import Hub
-from .wire import parse_imu_payload
+from .wire import parse_imu_payload, parse_stats_payload
 
 _VIEWER_HTML = (Path(__file__).parent / "viewer.html").read_bytes()
 _BOUNDARY = "slamframe"
@@ -73,6 +73,18 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.hub.put_imu(samples)
             for s in samples:
                 self.recorder.write_imu(s)
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif self.path.startswith("/stats"):
+            body = self._read_body()
+            try:
+                stats = parse_stats_payload(body)
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+            self.hub.put_stats(stats)
+            self.recorder.write_stats(stats)
             self.send_response(204)
             self.send_header("Content-Length", "0")
             self.end_headers()

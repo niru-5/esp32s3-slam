@@ -64,6 +64,42 @@ class ImuSample:
     gz: float
 
 
+# System-stats payload (little-endian, no padding — built field-by-field in
+# firmware/data_capture/main/sysstats.c::sysstats_serialize). Keep in sync with
+# SYSSTATS_WIRE_LEN / sysstats_snapshot_t in sysstats.h.
+_STATS = struct.Struct("<qfffiIIIIIIIIII")
+STATS_LEN = _STATS.size            # 64
+
+
+@dataclass
+class SysStats:
+    esp_us: int              # esp_timer µs at snapshot (shared clock)
+    cpu0_load: float         # core 0 load over last interval (%)
+    cpu1_load: float         # core 1 load (%)
+    chip_temp_c: float       # internal temperature sensor (°C)
+    wifi_rssi: int           # associated AP RSSI (dBm); 0 if unknown
+    uptime_s: int            # seconds since boot
+    heap_free: int           # total free heap (bytes, all caps)
+    heap_min_free: int       # minimum-ever free heap (bytes)
+    int_free: int            # internal DRAM free (bytes)
+    int_largest: int         # largest free internal block (bytes)
+    int_total: int           # internal DRAM total (bytes)
+    psram_free: int          # SPIRAM free (bytes; 0 if no PSRAM)
+    psram_min_free: int      # SPIRAM minimum-ever free (bytes)
+    psram_largest: int       # largest free SPIRAM block (bytes)
+    psram_total: int         # SPIRAM total (bytes)
+
+
+def parse_stats_payload(body: bytes) -> SysStats:
+    """Decode a ``/stats`` payload into a :class:`SysStats` snapshot.
+
+    Raises ``ValueError`` if the payload is the wrong length.
+    """
+    if len(body) < STATS_LEN:
+        raise ValueError(f"stats payload too short: {len(body)} < {STATS_LEN}")
+    return SysStats(*_STATS.unpack_from(body, 0))
+
+
 def parse_imu_payload(body: bytes) -> list[ImuSample]:
     """Decode an ``/imu`` payload into timestamped samples (oldest first).
 

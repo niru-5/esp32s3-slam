@@ -8,6 +8,8 @@ disabled and the server still runs as a live viewer.
 Topics written:
     /camera/image_raw/compressed   sensor_msgs/msg/CompressedImage  (jpeg)
     /imu/data                      sensor_msgs/msg/Imu
+    /esp32/diagnostics             diagnostic_msgs/msg/DiagnosticArray
+                                   (per-core CPU load, heap/PSRAM, temperature)
 
 Timestamps
 ----------
@@ -32,11 +34,13 @@ _DPS_TO_RADS = math.pi / 180.0
 
 IMAGE_TOPIC = "/camera/image_raw/compressed"
 IMU_TOPIC = "/imu/data"
+STATS_TOPIC = "/esp32/diagnostics"
 
 try:  # ROS 2 (sourced environment) — optional.
     import rosbag2_py
     from rclpy.serialization import serialize_message
     from sensor_msgs.msg import CompressedImage, Imu
+    from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
     _ROS_AVAILABLE = True
     _ROS_IMPORT_ERROR = ""
 except Exception as exc:  # pragma: no cover - depends on environment
@@ -85,6 +89,7 @@ class BagRecorder:
         )
         self._create_topic(IMAGE_TOPIC, "sensor_msgs/msg/CompressedImage")
         self._create_topic(IMU_TOPIC, "sensor_msgs/msg/Imu")
+        self._create_topic(STATS_TOPIC, "diagnostic_msgs/msg/DiagnosticArray")
 
     def _create_topic(self, name: str, msg_type: str) -> None:
         # Jazzy's TopicMetadata takes a leading integer id.
@@ -131,6 +136,38 @@ class BagRecorder:
             # No orientation estimate from a raw IMU — flag it per REP-145.
             msg.orientation_covariance[0] = -1.0
             self._writer.write(IMU_TOPIC, serialize_message(msg), ns)
+
+    def write_stats(self, stats) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            ns = self._ros_ns(stats.esp_us)
+            status = DiagnosticStatus()
+            status.name = "esp32s3"
+            status.hardware_id = "esp32-s3"
+            status.level = DiagnosticStatus.OK
+            status.message = "system telemetry"
+            # Emit every field as a KeyValue so it is queryable from the bag.
+            status.values = [
+                KeyValue(key="cpu0_load_pct", value=f"{stats.cpu0_load:.1f}"),
+                KeyValue(key="cpu1_load_pct", value=f"{stats.cpu1_load:.1f}"),
+                KeyValue(key="chip_temp_c", value=f"{stats.chip_temp_c:.1f}"),
+                KeyValue(key="wifi_rssi_dbm", value=str(stats.wifi_rssi)),
+                KeyValue(key="uptime_s", value=str(stats.uptime_s)),
+                KeyValue(key="heap_free", value=str(stats.heap_free)),
+                KeyValue(key="heap_min_free", value=str(stats.heap_min_free)),
+                KeyValue(key="internal_free", value=str(stats.int_free)),
+                KeyValue(key="internal_largest", value=str(stats.int_largest)),
+                KeyValue(key="internal_total", value=str(stats.int_total)),
+                KeyValue(key="psram_free", value=str(stats.psram_free)),
+                KeyValue(key="psram_min_free", value=str(stats.psram_min_free)),
+                KeyValue(key="psram_largest", value=str(stats.psram_largest)),
+                KeyValue(key="psram_total", value=str(stats.psram_total)),
+            ]
+            msg = DiagnosticArray()
+            _stamp_from_ns(msg.header.stamp, ns)
+            msg.status = [status]
+            self._writer.write(STATS_TOPIC, serialize_message(msg), ns)
 
     def close(self) -> None:
         with self._lock:
