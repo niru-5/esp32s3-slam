@@ -19,12 +19,12 @@
 #define WIFI_PASS "Someoneisusingmydata"
 
 // Data sinks — enable either or both.
-#define CONFIG_ENABLE_LOCAL_SERVER  1
-#define CONFIG_ENABLE_REMOTE_STREAM 0
+#define CONFIG_ENABLE_LOCAL_SERVER  0
+#define CONFIG_ENABLE_REMOTE_STREAM 1
 
 // Remote host to push to when CONFIG_ENABLE_REMOTE_STREAM is set.
-#define CONFIG_REMOTE_HOST "192.168.1.50"
+#define CONFIG_REMOTE_HOST "192.168.178.22"
 #define CONFIG_REMOTE_PORT 8080
 
 // Frame push rate for the remote stream (Hz). IMU is drained each cycle.
-#define CONFIG_REMOTE_STREAM_FPS 10
+#define CONFIG_REMOTE_STREAM_FPS 3
