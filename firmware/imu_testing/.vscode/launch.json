@@ -2,17 +2,21 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "type": "gdbtarget",
+            "request": "attach",
+            "name": "Eclipse CDT GDB Adapter",
+            "preLaunchTask": "kill-stale-openocd",
+            "postDebugTask": "kill-stale-openocd"
+        },
+        {
             "name": "ESP32-S3 Debug",
             "type": "cppdbg",
             "request": "launch",
             "MIMode": "gdb",
             "miDebuggerPath": "/home/niranjan/.espressif/tools/xtensa-esp-elf-gdb/17.1_20260402/xtensa-esp-elf-gdb/bin/xtensa-esp32s3-elf-gdb",
-            "program": "${workspaceFolder}/firmware/data_capture/build/data_capture.elf",
+            "program": "${workspaceFolder}/build/imu_testing.elf",
             "cwd": "${workspaceFolder}",
             "stopAtEntry": false,
-            // "sourceFileMap": {
-            //     "/builds/idf": "${workspaceFolder}"
-            // },
             "setupCommands": [
                 { "text": "target extended-remote localhost:3333" },
                 { "text": "monitor reset halt" },

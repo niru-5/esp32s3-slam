@@ -5,6 +5,7 @@
 #include "nvs_flash.h"
 #include "esp_http_server.h"
 #include "esp_timer.h"
+#include "esp_rom_sys.h"
 #include "driver/i2c.h"
 #include "driver/gpio.h"
 #include "mdns.h"
@@ -39,15 +40,17 @@
 #define PCLK_GPIO_NUM  13
 
 // --------------------------------------------------------------------------
-// BMI270 — I2C_NUM_1 (I2C_NUM_0 is reserved for camera SCCB on GPIO 4/5)
-// Wire BMI270: SDA→GPIO38, SCL→GPIO39, SDO→GND (addr 0x68), CSB→VDD
+// BMI270 over I2C (IMU_I2C_PORT). All mode/address pins are driven by the
+// ESP32, so the module needs only direct wiring — no breadboard pull resistors:
+//   SDA→GPIO41  SCL→GPIO42  CSB→GPIO47 (high→I2C)  SA0→GPIO48 (low→0x68)
 // --------------------------------------------------------------------------
 #define IMU_I2C_PORT   I2C_NUM_0
-#define IMU_SDA_GPIO   38
-#define IMU_SCL_GPIO   39
+#define IMU_SDA_GPIO   41
+#define IMU_SCL_GPIO   42
 #define IMU_I2C_FREQ   400000
-#define BMI270_ADDR    BMI2_I2C_PRIM_ADDR  // 0x68 when SDO=GND
-#define IMU_CSB_GPIO   40                   // driven HIGH to select I2C mode on BMI270
+#define BMI270_ADDR    BMI2_I2C_PRIM_ADDR  // 0x68 when SA0=low
+#define IMU_CSB_GPIO   47                   // driven HIGH → I2C mode on BMI270
+#define IMU_ADDR_GPIO  48                   // driven LOW  → I2C address 0x68 (SA0)
 
 // BMI2_SENSORTIME_RESOLUTION = 0.0000390625 s/tick = 39.0625 µs/tick
 // Host converts: sample_esp_us = ref_esp_us + (sens_time - ref_ticks) * 39.0625
@@ -111,12 +114,31 @@ static BMI2_INTF_RETURN_TYPE bmi2_i2c_write(uint8_t reg_addr, const uint8_t *dat
 }
 
 static void bmi2_delay_us_cb(uint32_t period, void *intf_ptr) {
-    if (period >= 1000) {
-        vTaskDelay(pdMS_TO_TICKS((period + 999) / 1000));
-    } else {
-        int64_t end = esp_timer_get_time() + period;
-        while (esp_timer_get_time() < end) {}
+    // Busy-wait the full period. BMI270 init needs an accurate 2 ms settle
+    // after soft-reset; routing sub-10 ms delays through
+    // vTaskDelay(pdMS_TO_TICKS(...)) truncates to 0 ticks at the default
+    // 100 Hz FreeRTOS tick and skips the wait (-> config upload COM_FAIL).
+    esp_rom_delay_us(period);
+}
+
+static void i2c_bus_scan(void) {
+    ESP_LOGI(TAG, "Scanning I2C%d on SDA=GPIO%d SCL=GPIO%d ...",
+             IMU_I2C_PORT, IMU_SDA_GPIO, IMU_SCL_GPIO);
+    int found = 0;
+    for (uint8_t addr = 0x03; addr < 0x78; addr++) {
+        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_stop(cmd);
+        esp_err_t ret = i2c_master_cmd_begin(IMU_I2C_PORT, cmd, pdMS_TO_TICKS(50));
+        i2c_cmd_link_delete(cmd);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "  -> ACK from address 0x%02X", (unsigned)addr);
+            found++;
+        }
     }
+    if (found == 0)
+        ESP_LOGW(TAG, "  no devices found (check SDA/SCL wiring, power, pull-ups)");
 }
 
 // --------------------------------------------------------------------------
@@ -124,16 +146,25 @@ static void bmi2_delay_us_cb(uint32_t period, void *intf_ptr) {
 // --------------------------------------------------------------------------
 
 static esp_err_t imu_init(void) {
-    // Pull CSB high to put BMI270 in I2C mode before any communication
-    gpio_config_t csb = {
-        .pin_bit_mask = 1ULL << IMU_CSB_GPIO,
+    // Drive the BMI270 mode/address pins before any communication so the
+    // module needs no external pull resistors:
+    //   CSB high → I2C mode,  SA0 low → address 0x68
+    // A falling edge on CSB latches the BMI270 into SPI mode until the next
+    // power-on, so CSB must never glitch low. Preset the output latches BEFORE
+    // switching the pins to output (otherwise output mode drives 0 first), and
+    // enable a pull-up on CSB to bias it high through the boot window.
+    gpio_set_level(IMU_CSB_GPIO, 1);   // preset CSB latch high
+    gpio_set_level(IMU_ADDR_GPIO, 0);  // preset SA0 latch low
+    gpio_config_t imu_pins = {
+        .pin_bit_mask = (1ULL << IMU_CSB_GPIO) | (1ULL << IMU_ADDR_GPIO),
         .mode         = GPIO_MODE_OUTPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type    = GPIO_INTR_DISABLE,
     };
-    gpio_config(&csb);
-    gpio_set_level(IMU_CSB_GPIO, 1);
+    gpio_config(&imu_pins);
+    gpio_set_level(IMU_CSB_GPIO, 1);   // I2C mode
+    gpio_set_level(IMU_ADDR_GPIO, 0);  // address 0x68
     vTaskDelay(pdMS_TO_TICKS(5)); // let BMI270 settle into I2C mode
 
     i2c_config_t cfg = {
@@ -146,6 +177,8 @@ static esp_err_t imu_init(void) {
     };
     ESP_ERROR_CHECK(i2c_param_config(IMU_I2C_PORT, &cfg));
     ESP_ERROR_CHECK(i2c_driver_install(IMU_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0));
+
+    i2c_bus_scan();
 
     s_bmi2.read           = bmi2_i2c_read;
     s_bmi2.write          = bmi2_i2c_write;
@@ -333,12 +366,45 @@ static esp_err_t imu_handler(httpd_req_t *req) {
     return res;
 }
 
+// Human-readable, non-destructive peek at the latest IMU sample (does NOT
+// drain the ring — safe to poll from a browser alongside the binary /imu).
+static esp_err_t imu_json_handler(httpd_req_t *req) {
+    xSemaphoreTake(s_imu_mutex, portMAX_DELAY);
+    uint32_t count = s_imu_count;
+    imu_sample_t latest = {0};
+    if (count > 0)
+        latest = s_imu_ring[(s_imu_write + IMU_RING_CAP - 1) % IMU_RING_CAP];
+    xSemaphoreGive(s_imu_mutex);
+
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"buffered\":%u,\"sens_time\":%u,"
+        "\"accel_g\":{\"x\":%.4f,\"y\":%.4f,\"z\":%.4f},"
+        "\"gyro_dps\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f}}",
+        (unsigned)count, (unsigned)latest.sens_time,
+        latest.ax, latest.ay, latest.az,
+        latest.gx, latest.gy, latest.gz);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, buf, n);
+}
+
 static esp_err_t index_handler(httpd_req_t *req) {
     const char *html =
     "<html><body style='background:#000;color:#fff;font-family:sans-serif'>"
     "<h2>ESP32-S3 SLAM Camera</h2>"
     "<img id='img' style='width:640px'>"
-    "<p>IMU binary stream: <code>GET /imu</code></p>"
+    "<p>IMU binary stream: <code>GET /imu</code> &nbsp;|&nbsp; readable: <code>GET /imu.json</code></p>"
+    "<pre id='imu'></pre>"
+    "<script>"
+    "setInterval(function(){"
+    "  fetch('/imu.json').then(r=>r.json()).then(j=>{"
+    "    document.getElementById('imu').textContent=JSON.stringify(j,null,2);"
+    "  }).catch(e=>{});"
+    "},200);"
+    "</script>"
     "<script>"
     "var img=document.getElementById('img');"
     "function next(){"
@@ -440,11 +506,12 @@ void app_main(void) {
     httpd_start(&server, &srv_cfg);
 
     httpd_uri_t uris[] = {
-        { .uri = "/",        .method = HTTP_GET, .handler = index_handler   },
-        { .uri = "/capture", .method = HTTP_GET, .handler = capture_handler },
-        { .uri = "/imu",     .method = HTTP_GET, .handler = imu_handler     },
+        { .uri = "/",         .method = HTTP_GET, .handler = index_handler    },
+        { .uri = "/capture",  .method = HTTP_GET, .handler = capture_handler  },
+        { .uri = "/imu",      .method = HTTP_GET, .handler = imu_handler      },
+        { .uri = "/imu.json", .method = HTTP_GET, .handler = imu_json_handler },
     };
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 4; i++)
         httpd_register_uri_handler(server, &uris[i]);
 
     ESP_LOGI(TAG, "HTTP server started");

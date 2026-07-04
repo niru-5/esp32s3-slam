@@ -1,0 +1,46 @@
+{
+  "folders": [
+    { "path": "." },
+    { "path": "firmware/data_capture" },
+    { "path": "firmware/imu_testing" }
+    // { "path": "firmware/camera_calibration" }
+  ],
+  "settings": {
+    "workbench.colorCustomizations": {
+      "activityBar.activeBackground": "#3333ff",
+      "activityBar.background": "#3333ff",
+      "activityBar.foreground": "#e7e7e7",
+      "activityBar.inactiveForeground": "#e7e7e799",
+      "activityBarBadge.background": "#600000",
+      "activityBarBadge.foreground": "#e7e7e7",
+      "commandCenter.border": "#e7e7e799",
+      "sash.hoverBorder": "#3333ff",
+      "statusBar.background": "#0000ff",
+      "statusBar.foreground": "#e7e7e7",
+      "statusBarItem.hoverBackground": "#3333ff",
+      "statusBarItem.remoteBackground": "#0000ff",
+      "statusBarItem.remoteForeground": "#e7e7e7",
+      "titleBar.activeBackground": "#0000ff",
+      "titleBar.activeForeground": "#e7e7e7",
+      "titleBar.inactiveBackground": "#0000ff99",
+      "titleBar.inactiveForeground": "#e7e7e799"
+    },
+    "peacock.color": "blue",
+    "C_Cpp.default.compileCommands": "${workspaceFolder:data_capture}/build/compile_commands.json",
+    "idf.openOcdConfigs": ["board/esp32s3-builtin.cfg"],
+    "idf.currentSetup": "/home/niranjan/.espressif/v5.3.5/esp-idf",
+    "idf.customExtraVars": {
+      "OPENOCD_SCRIPTS": "/home/niranjan/.espressif/tools/openocd-esp32/v0.12.0-esp32-20251215/openocd-esp32/share/openocd/scripts"
+    },
+    "idf.port": "/dev/ttyACM0",
+    "idf.monitorPort": "/dev/ttyACM0",
+    "idf.flashType": "UART",
+    "clangd.path": "/home/niranjan/.espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/bin/clangd",
+    "clangd.arguments": [
+      "--background-index",
+      "--query-driver=**",
+      "--compile-commands-dir=/hdd/side_projects/esp32s3-slam/build"
+    ],
+    "cmake.sourceDirectory": "/hdd/side_projects/esp32s3-slam/firmware/data_capture"
+  }
+}
