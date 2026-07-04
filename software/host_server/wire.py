@@ -1,0 +1,91 @@
+"""Decode the binary wire formats the ESP32-S3 firmware sends.
+
+The firmware (``firmware/data_capture``) pushes two payloads to this server
+when built with ``CONFIG_ENABLE_REMOTE_STREAM``:
+
+* ``POST /frame`` — a JPEG body plus an ``X-Timestamp-Us`` header (esp_timer
+  microseconds-since-boot captured at frame grab).
+* ``POST /imu`` — the binary IMU ring drain described below.
+
+IMU payload (little-endian, no padding — the firmware builds it with
+sequential ``memcpy`` in ``imu.c::imu_serialize``):
+
+    header (16 bytes):  uint32 num_samples
+                        int64  ref_esp_us         esp_timer us at drain time
+                        uint32 ref_sensor_ticks   BMI270 tick at drain time
+    sample (28 bytes):  uint32 sens_time          BMI270 tick when sampled
+                        float  ax, ay, az         accelerometer (g)
+                        float  gx, gy, gz          gyroscope (deg/s)
+
+Each sample's esp_timer timestamp is reconstructed on this side as:
+
+    sample_esp_us = ref_esp_us + wrap24(sens_time - ref_sensor_ticks) * 39.0625
+
+where ``wrap24`` interprets the tick delta as a signed 24-bit value (the BMI270
+sensor clock is 24 bits and wraps at 2**24 ticks). This is the mechanism that
+keeps camera and IMU samples on one shared clock — keep it in sync with the
+firmware's ``imu.h``.
+"""
+
+from __future__ import annotations
+
+import struct
+from dataclasses import dataclass
+
+# BMI270 sensor-time resolution — must match IMU_SENSORTIME_US in imu.h.
+SENSORTIME_US = 39.0625
+
+_HEADER = struct.Struct("<IqI")   # num_samples, ref_esp_us, ref_sensor_ticks
+_SAMPLE = struct.Struct("<Iffffff")
+
+HEADER_LEN = _HEADER.size          # 16
+SAMPLE_LEN = _SAMPLE.size          # 28
+
+_TICK_MASK = 0xFFFFFF              # 24-bit sensor clock
+_TICK_HALF = 0x800000
+
+
+def _wrap24(delta: int) -> int:
+    """Interpret a raw tick delta as a signed 24-bit value."""
+    delta &= _TICK_MASK
+    if delta >= _TICK_HALF:
+        delta -= 0x1000000
+    return delta
+
+
+@dataclass
+class ImuSample:
+    esp_us: int          # reconstructed esp_timer microseconds
+    ax: float            # accelerometer (g)
+    ay: float
+    az: float
+    gx: float            # gyroscope (deg/s)
+    gy: float
+    gz: float
+
+
+def parse_imu_payload(body: bytes) -> list[ImuSample]:
+    """Decode an ``/imu`` payload into timestamped samples (oldest first).
+
+    Returns an empty list for a well-formed drain that carried no samples, and
+    raises ``ValueError`` if the payload is truncated or malformed.
+    """
+    if len(body) < HEADER_LEN:
+        raise ValueError(f"IMU payload too short: {len(body)} < {HEADER_LEN}")
+
+    num, ref_esp_us, ref_ticks = _HEADER.unpack_from(body, 0)
+    expected = HEADER_LEN + num * SAMPLE_LEN
+    if len(body) < expected:
+        raise ValueError(
+            f"IMU payload truncated: got {len(body)} bytes, "
+            f"expected {expected} for {num} samples"
+        )
+
+    samples: list[ImuSample] = []
+    off = HEADER_LEN
+    for _ in range(num):
+        sens_time, ax, ay, az, gx, gy, gz = _SAMPLE.unpack_from(body, off)
+        off += SAMPLE_LEN
+        esp_us = ref_esp_us + round(_wrap24(sens_time - ref_ticks) * SENSORTIME_US)
+        samples.append(ImuSample(esp_us, ax, ay, az, gx, gy, gz))
+    return samples

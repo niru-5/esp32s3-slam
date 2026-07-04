@@ -1,0 +1,8 @@
+# Recorded ROS 2 bags
+bags/
+*.db3
+*.mcap
+
+# Python
+__pycache__/
+*.pyc

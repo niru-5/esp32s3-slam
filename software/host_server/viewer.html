@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32-S3 SLAM — live capture</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0d0f12; color: #e6e8eb;
+         font: 14px/1.5 system-ui, sans-serif; }
+  header { padding: 14px 20px; border-bottom: 1px solid #23262b;
+           display: flex; align-items: baseline; gap: 14px; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .rec { font-size: 12px; padding: 2px 8px; border-radius: 10px; }
+  .rec.on  { background: #3b1f24; color: #ff8080; }
+  .rec.off { background: #23262b; color: #9aa0a6; }
+  main { display: grid; grid-template-columns: minmax(320px, 1fr) 320px;
+         gap: 20px; padding: 20px; align-items: start; }
+  @media (max-width: 760px) { main { grid-template-columns: 1fr; } }
+  .frame { background: #000; border: 1px solid #23262b; border-radius: 8px;
+           overflow: hidden; }
+  .frame img { display: block; width: 100%; height: auto; }
+  .panel { background: #16191d; border: 1px solid #23262b; border-radius: 8px;
+           padding: 16px; }
+  .panel h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
+              color: #9aa0a6; margin: 0 0 10px; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 3px 0; }
+  td.k { color: #9aa0a6; }
+  td.v { text-align: right; font-variant-numeric: tabular-nums; }
+  .axes td.v { font-family: ui-monospace, monospace; }
+  .stat { display: flex; justify-content: space-between; padding: 4px 0; }
+  .stat b { font-variant-numeric: tabular-nums; }
+  .muted { color: #6b7178; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ESP32-S3 SLAM &mdash; live capture</h1>
+  <span id="rec" class="rec off">recording: ?</span>
+  <span id="bag" class="muted"></span>
+</header>
+<main>
+  <div class="frame"><img id="cam" alt="camera stream" src="/stream.mjpg"></div>
+  <div>
+    <div class="panel">
+      <h2>Stream</h2>
+      <div class="stat"><span>Frames</span><b id="frame_count">0</b></div>
+      <div class="stat"><span>Frame rate</span><b id="frame_fps">0</b> fps</div>
+      <div class="stat"><span>IMU samples</span><b id="imu_count">0</b></div>
+      <div class="stat"><span>IMU rate</span><b id="imu_hz">0</b> Hz</div>
+      <div class="stat"><span>Uptime</span><b id="uptime">0</b> s</div>
+    </div>
+    <div class="panel" style="margin-top:16px">
+      <h2>IMU (latest)</h2>
+      <table class="axes">
+        <tr><td class="k">accel (g)</td><td class="v" id="ax">–</td>
+            <td class="v" id="ay">–</td><td class="v" id="az">–</td></tr>
+        <tr><td class="k">gyro (dps)</td><td class="v" id="gx">–</td>
+            <td class="v" id="gy">–</td><td class="v" id="gz">–</td></tr>
+        <tr><td class="k">esp_us</td><td class="v" id="esp_us" colspan="3">–</td></tr>
+      </table>
+    </div>
+  </div>
+</main>
+<script>
+function f(x, d) { return (x === undefined || x === null) ? "–" : Number(x).toFixed(d); }
+async function poll() {
+  try {
+    const r = await fetch("/imu.json", { cache: "no-store" });
+    const j = await r.json();
+    document.getElementById("frame_count").textContent = j.frame_count;
+    document.getElementById("frame_fps").textContent = j.frame_fps;
+    document.getElementById("imu_count").textContent = j.imu_count;
+    document.getElementById("imu_hz").textContent = j.imu_hz;
+    document.getElementById("uptime").textContent = j.uptime_s;
+    const rec = document.getElementById("rec");
+    rec.textContent = "recording: " + (j.recording ? "on" : "off");
+    rec.className = "rec " + (j.recording ? "on" : "off");
+    document.getElementById("bag").textContent = j.bag_uri || "";
+    if (j.imu) {
+      document.getElementById("ax").textContent = f(j.imu.accel_g.x, 3);
+      document.getElementById("ay").textContent = f(j.imu.accel_g.y, 3);
+      document.getElementById("az").textContent = f(j.imu.accel_g.z, 3);
+      document.getElementById("gx").textContent = f(j.imu.gyro_dps.x, 2);
+      document.getElementById("gy").textContent = f(j.imu.gyro_dps.y, 2);
+      document.getElementById("gz").textContent = f(j.imu.gyro_dps.z, 2);
+      document.getElementById("esp_us").textContent = j.imu.esp_us;
+    }
+  } catch (e) { /* server momentarily busy */ }
+}
+setInterval(poll, 200);
+poll();
+</script>
+</body>
+</html>
