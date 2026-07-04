@@ -1,0 +1,96 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded: ~
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Plane Cell Count: 20
+      Reference Frame: <Fixed Frame>
+      Color: 160; 160; 160
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Show Names: true
+      Show Axes: true
+      Marker Scale: 1
+    - Class: rviz_default_plugins/Path
+      Name: VO Trajectory
+      Enabled: true
+      Topic:
+        Value: /vo/path
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+      Color: 25; 255; 0
+      Line Style: Billboards
+      Line Width: 0.08
+      Pose Style: None
+    - Class: rviz_default_plugins/Pose
+      Name: VO Pose
+      Enabled: true
+      Topic:
+        Value: /vo/pose
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+      Shape: Axes
+      Axes Length: 0.5
+      Axes Radius: 0.05
+    - Class: rviz_default_plugins/Pose
+      Name: IMU Orientation
+      Enabled: true
+      Topic:
+        Value: /imu/orientation
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+      Shape: Axes
+      Axes Length: 0.5
+      Axes Radius: 0.05
+    - Class: rviz_default_plugins/Image
+      Name: VO Features
+      Enabled: true
+      Topic:
+        Value: /vo/features
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+      Max Value: 1
+      Min Value: 0
+      Normalize Range: true
+  Global Options:
+    Background Color: 30; 30; 40
+    Fixed Frame: map
+    Frame Rate: 30
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Distance: 12
+      Pitch: 0.6
+      Yaw: 0.8
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+    Saved: ~
+Window Geometry:
+  Height: 850
+  Width: 1300
+  Displays:
+    collapsed: false
