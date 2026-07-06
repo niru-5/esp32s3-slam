@@ -37,3 +37,14 @@
 // can see which stage dominates cycle time. See debug_time.h.
 #define CONFIG_DEBUG_TIME 0
 
+// SD card logging (camera frames + IMU samples to local storage, independent
+// of the network sinks above).
+//   CONFIG_USE_SDCARD          — mount the SD card and log frames/IMU to it.
+//   CONFIG_ENABLE_SDCARD_FORMAT — if the card fails to mount (blank or a
+//                                 filesystem FatFs doesn't recognise), format
+//                                 it instead of failing. Leave off once a
+//                                 card has been formatted, to avoid wiping it
+//                                 on an unrelated mount failure.
+#define CONFIG_USE_SDCARD           0
+#define CONFIG_ENABLE_SDCARD_FORMAT 0
+
