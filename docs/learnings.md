@@ -1,8 +1,9 @@
-# Learnings — BMI270 bring-up on ESP32-S3
+# Learnings — ESP32-S3 SLAM firmware bring-up
 
-Debugging notes from getting the BMI270 IMU working reliably in both
-`firmware/imu_testing` and `firmware/data_capture`. Written newest-understanding-first
-so the non-obvious traps are easy to re-find later.
+Debugging notes from bringing up `data_capture` and `imu_testing` on the
+ESP32-S3 board. Written newest-understanding-first so the non-obvious traps
+are easy to re-find later. Sections 1-5 are BMI270-specific; later sections
+cover the remote-stream network path and SD card logging.
 
 ---
 
@@ -145,3 +146,160 @@ BMI270 wiring — all mode/address pins driven by the ESP32, no breadboard:
    soft-reset settle; busy-wait it.
 3. In `data_capture`, IMU on `I2C_NUM_0` (port 1 belongs to the camera).
 4. Boot log values don't match source? → force a clean rebuild (stale object).
+
+---
+
+## 6. WiFi modem-sleep power save adds 100s of ms to every request — but isn't the whole story
+
+**Symptom:** `CONFIG_DEBUG_TIME` showed camera/IMU "sending" (the network POST) taking
+300-600 ms per request, despite capture itself taking under 2 ms and excellent WiFi
+signal.
+
+**Cause:** ESP-IDF's default WiFi power save (modem sleep) duty-cycles the radio around
+the AP's DTIM interval (here, 102.4 ms) to save power. Every request that has to round-trip
+to the AP pays a variable tax from this duty cycle, unrelated to payload size.
+
+**Fix:** `esp_wifi_set_ps(WIFI_PS_NONE)` right after `esp_wifi_start()`. This app streams
+every cycle and isn't power-constrained, so there's no reason to duty-cycle the radio.
+
+**Caveat — this alone did not fix the latency** (see §7 below): after disabling power
+save, times got *worse*, not better, because the actual dominant cost was TCP connection
+churn, not power save. Power save is still worth disabling for a latency-sensitive
+streaming app, but don't assume it's the whole story if numbers don't improve — check
+signal strength (RSSI) and connection-reuse patterns too before concluding it "didn't
+work."
+
+---
+
+## 7. Per-request TCP churn exhausts LWIP's connection table — the real cause of multi-second stalls
+
+**Symptom:** even after `WIFI_PS_NONE`, excellent RSSI (-42 dBm — about as good as WiFi
+gets), and ruling out host-side disk I/O (`host_server --no-record`), POST latency
+stayed erratic: 400-1900 ms, uncorrelated with payload size. Numbers got *worse* over a
+longer test run, not better.
+
+**Cause:** `net_client.c`'s `post_bytes()` did a fresh `esp_http_client_init()` →
+`perform()` → `cleanup()` for **every single POST** (frame + imu + occasionally stats —
+2-3 brand-new TCP connections every ~333 ms cycle). `esp_http_client_cleanup()` actively
+closes the socket from the ESP32 side, so the ESP32 (not the server) becomes the TCP
+active-closer and owns the resulting **TIME_WAIT** state. The project's sdkconfig has
+`CONFIG_LWIP_MAX_ACTIVE_TCP=16` and `CONFIG_LWIP_TCP_MSL=60000` (60 s) — at this request
+rate, accumulated TIME_WAIT entries exhaust the 16-slot connection table within seconds,
+and once exhausted, new `esp_http_client_init()` calls stall waiting for a slot to free.
+The specific ~1.5-1.9 s outliers matched `CONFIG_LWIP_TCP_RTO_TIME=1500` (the TCP
+retransmit timeout) almost exactly — a strong tell that this is a *TCP-table*-scale
+problem (seconds), not a *WiFi-power-save*-scale one (100s of ms).
+
+**Fix:** keep one `esp_http_client` handle alive across the whole stream task and reuse
+it for every POST — call `esp_http_client_set_url()`/`set_method()` between requests
+instead of `init()`/`cleanup()`, and only tear down + reconnect on an actual `perform()`
+failure. HTTP/1.1 keep-alive lets one TCP connection serve frame + imu + stats back to
+back.
+
+**General rule:** never `esp_http_client_init()`/`cleanup()` per-request in a tight
+polling loop on ESP32 — reuse the handle. If request latency is large, *variable*, and
+uncorrelated with payload size, suspect LWIP's TCP PCB table (`CONFIG_LWIP_MAX_ACTIVE_TCP`)
+being starved by connection churn *before* suspecting WiFi/RF — RF-layer problems tend to
+produce more uniformly bad numbers, not this kind of erratic bimodal pattern.
+
+---
+
+## 8. Identifying an undocumented SD card slot from its silkscreen + camera pinout
+
+**Symptom:** the board's microSD slot came pre-wired from the vendor with no schematic —
+needed the CLK/CMD/D0 GPIOs before writing any code.
+
+**Method:** matched the board's silkscreen text (`ESP32-S3 N16R8 Development Board ...
+N16R8 CAM`) and the camera pinout already reverse-engineered in `camera.c` (all 14
+GPIOs) against public references for two differently-branded boards (GOOUUU Tech
+ESP32-S3-CAM, keyestudio MB0184) — both turned out to describe the exact same whitelabel
+reference design (same module variant, identical camera pins).
+
+**Result (confirmed against real hardware):** SDMMC **1-bit** mode, `CLK=GPIO39`,
+`CMD=GPIO38`, `D0=GPIO40`. Verified correct on first real flash — the SDMMC driver
+successfully read the card's CID/CSD/SSR registers (`Name:`, `Type:`, `Size:` etc.
+printed at boot) using exactly these pins.
+
+**General rule:** for an unlabeled peripheral on a board bought without documentation,
+matching its silkscreen text plus an already-known pinout (here, the camera) against
+public references for the same reference design is a reliable identification method —
+but cross-check at least two independent sources before wiring anything.
+
+---
+
+## 9. A 64 GB SD card ships exFAT by default — `FR_NO_FILESYSTEM` (13) on first mount
+
+**Symptom:** first real-hardware mount attempt logged
+`W vfs_fat_sdmmc: failed to mount card (13)`.
+
+**Cause:** FRESULT `13` = `FR_NO_FILESYSTEM`. SD cards ≥64 GB (SDXC class) ship
+pre-formatted **exFAT** per the SD Association spec. ESP-IDF's default FatFs build
+doesn't understand exFAT, so it reports "no filesystem" even though the card itself is
+fine — this is a card-capacity-class issue, not a wiring or card-quality problem.
+
+**Fix:** `esp_vfs_fat_mount_config_t.format_if_mount_failed = true` (gated behind
+`CONFIG_ENABLE_SDCARD_FORMAT` in this project) — on mount failure, ESP-IDF partitions and
+reformats the card as FAT32 itself, guaranteeing compatibility with its own driver.
+Confirmed working end to end: the same boot log showed `partitioning card` →
+`formatting card, allocation unit size=32768` → `mounting again` → success, fully
+automatically.
+
+**Rule:** don't assume `FR_NO_FILESYSTEM` on a fresh card means bad wiring — check the
+card's capacity class first. Leave `CONFIG_ENABLE_SDCARD_FORMAT` off again once a card
+has been formatted once, so an unrelated future mount failure can't silently reformat
+(and wipe) it.
+
+---
+
+## 10. FatFs defaults to 8.3 short filenames — descriptive filenames fail `mkdir`/`fopen` silently
+
+**Symptom:** after the mount/format above succeeded, every
+`mkdir("/sdcard/sess_NNNN")` call still failed. Worse, the code's own retry loop (meant
+to skip past already-used session numbers) treated *every* `mkdir()` failure as "name
+taken, try the next one," silently burning through all 10000 candidates and surfacing
+only a generic "could not create a session directory" error — no hint of the real cause.
+
+**Cause:** `CONFIG_FATFS_LFN_NONE` (ESP-IDF's default) restricts FatFs to classic 8.3
+short names: 8 characters + a 3-character extension, no exceptions. `sess_0000` is 9
+characters; `frame_<capture_ms>.jpg` and `imu_<dump_ms>.json` are far longer. Every
+`mkdir`/`fopen` call with these names was doomed regardless of the retry logic.
+
+**Fix:** switch to `CONFIG_FATFS_LFN_HEAP` (long filenames, with the temporary LFN work
+buffer allocated from heap rather than growing every task's stack — the alternative,
+`CONFIG_FATFS_LFN_STACK`, would require bumping the stack size of every task that
+touches the filesystem).
+
+**Compounding bug worth generalizing:** the retry loop's real flaw was checking only
+`mkdir() == 0` and treating any nonzero return the same way. It should check `errno`
+and only retry-with-next-candidate on `EEXIST`; anything else is a real error and should
+fail loudly and immediately instead of masking itself behind thousands of silent
+retries. Apply this any time "try the next candidate name" logic wraps a syscall.
+
+---
+
+## 11. Adding FATFS/SDMMC support needs headroom — bump the app partition ahead of time
+
+**Symptom:** first build after adding `sdcard.c` failed at the size-check step:
+`app partition is too small ... overflow 0x6cb0` (~27 KB over a 1 MB partition), even
+though compilation itself succeeded.
+
+**Cause:** the FATFS + SDMMC host driver code is not free — it pushed the binary over
+the project's default `CONFIG_PARTITION_TABLE_SINGLE_APP` (1 MB app partition).
+
+**Fix:** switched to `CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE` (2 MB app partition) —
+safe headroom given this board's 16 MB flash (N16R8).
+
+---
+
+## TL;DR checklist: data_capture streaming is slow / SD card won't mount
+1. Network POST taking 100s of ms and it's not obviously the WiFi signal (check RSSI via
+   `/stats`)? → try `WIFI_PS_NONE` first, but don't stop there.
+2. Still slow/erratic after that, uncorrelated with payload size? → suspect TCP
+   connection churn exhausting `CONFIG_LWIP_MAX_ACTIVE_TCP` before blaming the radio.
+   Reuse one `esp_http_client` handle instead of `init()`/`cleanup()` per request.
+3. SD card mount fails with `FR_NO_FILESYSTEM` (13) on a card ≥64 GB? → it shipped
+   exFAT; `format_if_mount_failed` reformats it as FAT32 automatically.
+4. `mkdir()`/`fopen()` failing on a freshly-mounted card with no clear reason? → check
+   `CONFIG_FATFS_LFN_NONE` — descriptive (>8.3) filenames need `CONFIG_FATFS_LFN_HEAP`.
+5. Build suddenly overflows the app partition after adding a new driver (FATFS, SDMMC,
+   etc.)? → switch to `CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE` if flash size allows.
