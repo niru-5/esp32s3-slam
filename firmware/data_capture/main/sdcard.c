@@ -2,6 +2,8 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <sys/stat.h>
 
@@ -36,8 +38,12 @@ static esp_err_t make_session_dir(void) {
     for (int i = 0; i < 10000; i++) {
         snprintf(s_session_dir, sizeof(s_session_dir), SD_MOUNT_POINT "/sess_%04d", i);
         if (mkdir(s_session_dir, 0775) == 0) return ESP_OK;
+        if (errno != EEXIST) {
+            ESP_LOGE(TAG, "mkdir %s failed: %s", s_session_dir, strerror(errno));
+            return ESP_FAIL;
+        }
     }
-    ESP_LOGE(TAG, "could not create a session directory under " SD_MOUNT_POINT);
+    ESP_LOGE(TAG, "no free session slot under " SD_MOUNT_POINT " (sess_0000..sess_9999 all exist)");
     return ESP_FAIL;
 }
 
