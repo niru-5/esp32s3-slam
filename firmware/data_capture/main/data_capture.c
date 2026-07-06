@@ -10,6 +10,7 @@
 #include "sysstats.h"
 #include "server_local.h"
 #include "net_client.h"
+#include "sdcard.h"
 
 static const char *TAG = "SLAM";
 
@@ -72,6 +73,11 @@ void app_main(void) {
     if (imu_start() != ESP_OK) return;
     sysstats_start();  // best-effort telemetry; failure is non-fatal
 
+#if CONFIG_USE_SDCARD
+    if (sdcard_start() != ESP_OK)
+        ESP_LOGW(TAG, "SD card logging unavailable — continuing without it");
+#endif
+
 #if CONFIG_ENABLE_LOCAL_SERVER
     server_local_start();
 #endif
@@ -80,7 +86,7 @@ void app_main(void) {
     net_client_start(CONFIG_REMOTE_HOST, CONFIG_REMOTE_PORT, CONFIG_REMOTE_STREAM_FPS);
 #endif
 
-#if !CONFIG_ENABLE_LOCAL_SERVER && !CONFIG_ENABLE_REMOTE_STREAM
+#if !CONFIG_ENABLE_LOCAL_SERVER && !CONFIG_ENABLE_REMOTE_STREAM && !CONFIG_USE_SDCARD
     ESP_LOGW(TAG, "no data sink enabled — capturing but not transmitting");
 #endif
 }

@@ -8,6 +8,7 @@ idf_component_register(
         "sysstats.c"
         "server_local.c"
         "net_client.c"
+        "sdcard.c"
         "${BMI_API}/bmi2.c"
         "${BMI_API}/bmi270.c"
     INCLUDE_DIRS

@@ -19,7 +19,10 @@
 // it intact when touching this module.
 // --------------------------------------------------------------------------
 
-#define IMU_RING_CAP 200                  // 2 s at 100 Hz
+#define IMU_RING_CAP 1000                 // 10 s at the current 100 Hz ODR;
+                                           // sized for ~1 s once ODR is raised
+                                           // toward 1 kHz (not yet done — the
+                                           // BMI270 ODR in imu.c is still 100 Hz)
 #define IMU_SENSORTIME_US 39.0625         // BMI270 tick resolution (µs)
 
 // On-wire IMU payload sizes (little-endian), shared by the local server and
@@ -48,6 +51,13 @@ uint32_t imu_drain(imu_sample_t *out, int64_t *ref_esp_us,
 // Drain the ring and serialize it into the on-wire payload described above.
 // `out` must hold at least IMU_WIRE_MAXLEN bytes. Returns bytes written.
 size_t imu_serialize(uint8_t *out);
+
+// A second, independent drain of the same 100 Hz sample stream — same
+// semantics as imu_drain() but backed by its own ring, so the SD-card logger
+// can run concurrently with imu_drain()/imu_serialize() (e.g. the network
+// stream) without the two stealing samples from each other.
+uint32_t imu_sdlog_drain(imu_sample_t *out, int64_t *ref_esp_us,
+                         uint32_t *ref_sensor_ticks);
 
 // Non-destructive copy of the most recent sample (for a human-readable peek).
 // Returns the number of samples currently buffered; `out` may be left zeroed

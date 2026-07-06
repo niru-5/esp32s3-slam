@@ -33,6 +33,13 @@ static uint32_t          s_imu_write = 0;   // index of next write slot
 static uint32_t          s_imu_count = 0;   // valid samples in ring
 static SemaphoreHandle_t s_imu_mutex;
 
+// Second ring fed by the same imu_task(), drained independently via
+// imu_sdlog_drain() — see the comment on that declaration in imu.h.
+static imu_sample_t      s_imu_sdlog_ring[IMU_RING_CAP];
+static uint32_t          s_imu_sdlog_write = 0;
+static uint32_t          s_imu_sdlog_count = 0;
+static SemaphoreHandle_t s_imu_sdlog_mutex;
+
 static struct bmi2_dev   s_bmi2;
 static float             s_raw_to_gs;       // int16 → g
 static float             s_raw_to_dps;      // int16 → deg/s
@@ -224,6 +231,12 @@ static void imu_task(void *arg) {
         s_imu_write = (s_imu_write + 1) % IMU_RING_CAP;
         if (s_imu_count < IMU_RING_CAP) s_imu_count++;
         xSemaphoreGive(s_imu_mutex);
+
+        xSemaphoreTake(s_imu_sdlog_mutex, portMAX_DELAY);
+        s_imu_sdlog_ring[s_imu_sdlog_write] = s;
+        s_imu_sdlog_write = (s_imu_sdlog_write + 1) % IMU_RING_CAP;
+        if (s_imu_sdlog_count < IMU_RING_CAP) s_imu_sdlog_count++;
+        xSemaphoreGive(s_imu_sdlog_mutex);
     }
 }
 
@@ -233,7 +246,8 @@ static void imu_task(void *arg) {
 
 esp_err_t imu_start(void) {
     s_imu_mutex = xSemaphoreCreateMutex();
-    if (!s_imu_mutex) return ESP_ERR_NO_MEM;
+    s_imu_sdlog_mutex = xSemaphoreCreateMutex();
+    if (!s_imu_mutex || !s_imu_sdlog_mutex) return ESP_ERR_NO_MEM;
 
     esp_err_t err = bmi270_bringup();
     if (err != ESP_OK) {
@@ -248,25 +262,43 @@ esp_err_t imu_start(void) {
     return ESP_OK;
 }
 
-uint32_t imu_drain(imu_sample_t *out, int64_t *ref_esp_us,
-                   uint32_t *ref_sensor_ticks) {
-    // Snapshot ring and clear it.
-    xSemaphoreTake(s_imu_mutex, portMAX_DELAY);
-    uint32_t count  = s_imu_count;
-    uint32_t oldest = (s_imu_write + IMU_RING_CAP - count) % IMU_RING_CAP;
-    for (uint32_t i = 0; i < count; i++)
-        out[i] = s_imu_ring[(oldest + i) % IMU_RING_CAP];
-    s_imu_count = 0;
-    s_imu_write = 0;
-    xSemaphoreGive(s_imu_mutex);
+// Snapshot `ring` into `out` and clear it. Shared by imu_drain() and
+// imu_sdlog_drain() — the two rings are otherwise independent.
+static uint32_t ring_drain(imu_sample_t *ring, uint32_t *write, uint32_t *count,
+                            SemaphoreHandle_t mutex, imu_sample_t *out) {
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    uint32_t n      = *count;
+    uint32_t oldest = (*write + IMU_RING_CAP - n) % IMU_RING_CAP;
+    for (uint32_t i = 0; i < n; i++)
+        out[i] = ring[(oldest + i) % IMU_RING_CAP];
+    *count = 0;
+    *write = 0;
+    xSemaphoreGive(mutex);
+    return n;
+}
 
-    // Reference pair — taken right after clearing so the offset applies to the
-    // samples we just snapshotted.
+// Reference pair — taken right after clearing a ring so the offset applies to
+// the samples just snapshotted from it.
+static void capture_ref(int64_t *ref_esp_us, uint32_t *ref_sensor_ticks) {
     struct bmi2_sens_data ref;
     memset(&ref, 0, sizeof(ref));
     bmi2_get_sensor_data(&ref, &s_bmi2);
     if (ref_esp_us)       *ref_esp_us       = esp_timer_get_time();
     if (ref_sensor_ticks) *ref_sensor_ticks = ref.sens_time;
+}
+
+uint32_t imu_drain(imu_sample_t *out, int64_t *ref_esp_us,
+                   uint32_t *ref_sensor_ticks) {
+    uint32_t count = ring_drain(s_imu_ring, &s_imu_write, &s_imu_count, s_imu_mutex, out);
+    capture_ref(ref_esp_us, ref_sensor_ticks);
+    return count;
+}
+
+uint32_t imu_sdlog_drain(imu_sample_t *out, int64_t *ref_esp_us,
+                         uint32_t *ref_sensor_ticks) {
+    uint32_t count = ring_drain(s_imu_sdlog_ring, &s_imu_sdlog_write, &s_imu_sdlog_count,
+                                 s_imu_sdlog_mutex, out);
+    capture_ref(ref_esp_us, ref_sensor_ticks);
     return count;
 }
 

@@ -48,3 +48,8 @@
 #define CONFIG_USE_SDCARD           0
 #define CONFIG_ENABLE_SDCARD_FORMAT 0
 
+// Camera frame save rate for the SD card sink (Hz), independent of
+// CONFIG_REMOTE_STREAM_FPS. The IMU ring is dumped to JSON once a second
+// regardless of this setting.
+#define CONFIG_SDCARD_FPS 3
+
