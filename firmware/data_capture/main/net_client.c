@@ -28,6 +28,15 @@ typedef struct {
     int      fps;
 } stream_cfg_t;
 
+// Reused across every POST (frame/imu/stats, every cycle) instead of
+// init+cleanup per call. A fresh esp_http_client per POST left the closed
+// socket in TIME_WAIT on the ESP32 side; with LWIP_MAX_ACTIVE_TCP=16 and
+// TCP_MSL=60s, that pool exhausts within seconds at this request rate, and
+// subsequent connects stall waiting for a slot (surfacing as multi-second
+// "sending" times matching CONFIG_LWIP_TCP_RTO_TIME's 1.5s retransmit timer).
+// Keeping one HTTP/1.1 keep-alive connection open avoids the churn entirely.
+static esp_http_client_handle_t s_http_client = NULL;
+
 // POST a body to http://host:port<path>. `ts_us` (>=0) is sent as the
 // X-Timestamp-Us header. Returns ESP_OK on a completed request.
 static esp_err_t post_bytes(const stream_cfg_t *cfg, const char *path,
@@ -36,26 +45,36 @@ static esp_err_t post_bytes(const stream_cfg_t *cfg, const char *path,
     char url[128];
     snprintf(url, sizeof(url), "http://%s:%u%s", cfg->host, (unsigned)cfg->port, path);
 
-    esp_http_client_config_t hc = {
-        .url        = url,
-        .method     = HTTP_METHOD_POST,
-        .timeout_ms = 2000,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&hc);
-    if (!client) return ESP_FAIL;
+    if (!s_http_client) {
+        esp_http_client_config_t hc = {
+            .url        = url,
+            .method     = HTTP_METHOD_POST,
+            .timeout_ms = 2000,
+        };
+        s_http_client = esp_http_client_init(&hc);
+        if (!s_http_client) return ESP_FAIL;
+    } else {
+        esp_http_client_set_url(s_http_client, url);
+        esp_http_client_set_method(s_http_client, HTTP_METHOD_POST);
+    }
 
-    esp_http_client_set_header(client, "Content-Type", content_type);
+    esp_http_client_set_header(s_http_client, "Content-Type", content_type);
     if (ts_us >= 0) {
         char ts_str[24];
         snprintf(ts_str, sizeof(ts_str), "%lld", ts_us);
-        esp_http_client_set_header(client, "X-Timestamp-Us", ts_str);
+        esp_http_client_set_header(s_http_client, "X-Timestamp-Us", ts_str);
+    } else {
+        esp_http_client_delete_header(s_http_client, "X-Timestamp-Us");
     }
-    esp_http_client_set_post_field(client, (const char *)body, len);
+    esp_http_client_set_post_field(s_http_client, (const char *)body, len);
 
-    esp_err_t err = esp_http_client_perform(client);
-    if (err != ESP_OK)
+    esp_err_t err = esp_http_client_perform(s_http_client);
+    if (err != ESP_OK) {
         ESP_LOGW(TAG, "POST %s failed: %s", path, esp_err_to_name(err));
-    esp_http_client_cleanup(client);
+        // Connection may be wedged — drop it and reconnect fresh next call.
+        esp_http_client_cleanup(s_http_client);
+        s_http_client = NULL;
+    }
     return err;
 }
 
