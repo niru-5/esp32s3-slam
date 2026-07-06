@@ -50,6 +50,12 @@ static void wifi_start(void) {
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
     esp_wifi_start();
+    // Default modem-sleep power save duty-cycles the radio around the AP's
+    // DTIM interval, adding 100s of ms of variable latency to every
+    // request/response round trip. This app is latency-sensitive (streaming
+    // frames + IMU every cycle), not power-constrained, so keep the radio
+    // fully awake.
+    esp_wifi_set_ps(WIFI_PS_NONE);
     esp_wifi_connect();
 }
 
