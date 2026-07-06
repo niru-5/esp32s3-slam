@@ -12,6 +12,7 @@
 #include "camera.h"
 #include "imu.h"
 #include "sysstats.h"
+#include "debug_time.h"
 
 static const char *TAG = "NET";
 
@@ -82,16 +83,25 @@ static void stream_task(void *arg) {
         vTaskDelayUntil(&last_wake, period);
 
         // Frame with its grab timestamp.
+        DEBUG_TIME_START(t_cam_cap);
         int64_t ts;
         camera_fb_t *fb = camera_grab(&ts);
+        DEBUG_TIME_END(t_cam_cap, TAG, "camera capturing");
         if (fb) {
+            DEBUG_TIME_START(t_cam_send);
             post_bytes(cfg, "/frame", "image/jpeg", fb->buf, fb->len, ts);
+            DEBUG_TIME_END(t_cam_send, TAG, "camera sending");
             camera_release(fb);
         }
 
         // IMU drain since last cycle.
+        DEBUG_TIME_START(t_imu_cap);
         size_t imu_len = imu_serialize(imu_buf);
+        DEBUG_TIME_END(t_imu_cap, TAG, "imu capturing");
+
+        DEBUG_TIME_START(t_imu_send);
         post_bytes(cfg, "/imu", "application/octet-stream", imu_buf, imu_len, -1);
+        DEBUG_TIME_END(t_imu_send, TAG, "imu sending");
 
         // System stats snapshot, throttled to CONFIG_REMOTE_STATS_HZ.
         int64_t now = esp_timer_get_time();

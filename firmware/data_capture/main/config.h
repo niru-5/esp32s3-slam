@@ -33,3 +33,7 @@
 // telemetry adds negligible compute over the camera + IMU streaming.
 #define CONFIG_REMOTE_STATS_HZ 1
 
+// When set, log elapsed ms for each capture/send stage (camera + IMU) so you
+// can see which stage dominates cycle time. See debug_time.h.
+#define CONFIG_DEBUG_TIME 0
+

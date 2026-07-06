@@ -7,6 +7,7 @@
 
 #include "camera.h"
 #include "imu.h"
+#include "debug_time.h"
 
 static const char *TAG = "SRV";
 
@@ -14,8 +15,10 @@ static const char *TAG = "SRV";
 // GET /capture — one JPEG frame with its grab timestamp.
 // --------------------------------------------------------------------------
 static esp_err_t capture_handler(httpd_req_t *req) {
+    DEBUG_TIME_START(t_cap);
     int64_t ts;
     camera_fb_t *fb = camera_grab(&ts);
+    DEBUG_TIME_END(t_cap, TAG, "camera capturing");
     if (!fb) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
@@ -25,7 +28,9 @@ static esp_err_t capture_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "image/jpeg");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_set_hdr(req, "X-Timestamp-Us", ts_str);
+    DEBUG_TIME_START(t_send);
     esp_err_t res = httpd_resp_send(req, (char *)fb->buf, fb->len);
+    DEBUG_TIME_END(t_send, TAG, "camera sending");
     camera_release(fb);
     return res;
 }
@@ -39,11 +44,15 @@ static esp_err_t imu_handler(httpd_req_t *req) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
+    DEBUG_TIME_START(t_cap);
     size_t body_len = imu_serialize(body);
+    DEBUG_TIME_END(t_cap, TAG, "imu capturing");
 
     httpd_resp_set_type(req, "application/octet-stream");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    DEBUG_TIME_START(t_send);
     esp_err_t res = httpd_resp_send(req, (char *)body, (ssize_t)body_len);
+    DEBUG_TIME_END(t_send, TAG, "imu sending");
     free(body);
     return res;
 }
