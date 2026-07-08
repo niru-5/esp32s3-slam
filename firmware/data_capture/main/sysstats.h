@@ -6,19 +6,23 @@
 
 // --------------------------------------------------------------------------
 // Lightweight ESP32-S3 system telemetry — per-core CPU load, heap/PSRAM usage,
-// chip temperature, WiFi RSSI and uptime. Collected cheaply (a ~1 Hz snapshot,
-// a handful of O(1) heap queries plus one FreeRTOS task-state enumeration) so
-// it never competes with the camera/IMU/WiFi work.
+// chip temperature, WiFi RSSI and uptime.
 //
 // Per-core load is derived from the FreeRTOS per-core idle-task runtime
 // counters (needs CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS + USE_TRACE_FACILITY,
 // both enabled in sdkconfig). Each snapshot reports the load over the interval
 // since the previous snapshot, so callers should sample at a steady cadence.
 //
-// The snapshot is serialized into a fixed 64-byte little-endian payload (mirror
-// of sysstats_snapshot_t below, built field-by-field to avoid struct padding)
-// and pushed to the host as `POST /stats`. Keep this layout in sync with the
-// host decoder in software/host_server/wire.py::parse_stats_payload.
+// The wire payload (sysstats_serialize_snapshot) is a fixed 64-byte
+// little-endian encoding of sysstats_snapshot_t, built field-by-field to
+// avoid struct padding, and matches software/host_server/wire.py exactly --
+// do not change this layout without updating wire.py too.
+//
+// Stats pipeline (see docs/architecture.md "Stats pipeline data flow"):
+// stats_producer_task samples this module every CONFIG_STATS_PRODUCER_PERIOD_MS
+// and pushes the raw snapshot to stats_queue; stats_writer_task drains it and
+// either serializes to the wire format (wifi sink) or formats it as JSON
+// (sdcard sink) -- see sysstats_pipeline_start().
 // --------------------------------------------------------------------------
 
 // On-wire payload: i64 + 3*f32 + i32 + 10*u32 = 8 + 12 + 4 + 40 = 64 bytes.
@@ -42,11 +46,38 @@ typedef struct {
     uint32_t psram_total;       // SPIRAM total (bytes)
 } sysstats_snapshot_t;
 
+typedef enum {
+    SYSSTATS_SINK_WIFI,
+    SYSSTATS_SINK_SDCARD,
+} sysstats_sink_t;
+
 // Initialise the chip temperature sensor and prime the CPU-load baseline.
-// Safe to skip — sysstats_serialize() still works, just without temperature and
-// with the first CPU-load reading reported as 0.
+// Boot-time, once. Safe to skip — sysstats_fill() still works, just without
+// temperature and with the first CPU-load reading reported as 0.
 esp_err_t sysstats_start(void);
 
-// Fill a fresh snapshot and serialize it into `out` (>= SYSSTATS_WIRE_LEN
-// bytes). Returns the number of bytes written (SYSSTATS_WIRE_LEN).
-size_t sysstats_serialize(uint8_t *out);
+// Fill a fresh snapshot (current CPU load, heap, temperature, ...).
+void sysstats_fill(sysstats_snapshot_t *out);
+
+// Serialize an already-filled snapshot into `out` (>= SYSSTATS_WIRE_LEN
+// bytes). Pure serialize -- does not sample anything. Returns
+// SYSSTATS_WIRE_LEN.
+size_t sysstats_serialize_snapshot(const sysstats_snapshot_t *s, uint8_t *out);
+
+// Format an already-filled snapshot as one JSON object (no trailing
+// newline), for the SD card stats log. Returns the number of bytes written
+// (excluding the NUL terminator).
+size_t sysstats_snapshot_to_json(const sysstats_snapshot_t *s, char *out, size_t out_sz);
+
+// Create stats_producer_task (prio CONFIG_STATS_PRODUCER_PRIORITY, core
+// CONFIG_STATS_PRODUCER_CORE, period CONFIG_STATS_PRODUCER_PERIOD_MS) +
+// stats_queue (CONFIG_STATS_QUEUE_LEN deep), and stats_writer_task (prio
+// CONFIG_STATS_CONSUMER_PRIORITY, core CONFIG_STATS_CONSUMER_CORE, period
+// CONFIG_STATS_CONSUMER_PERIOD_MS) wired to `sink` for its whole lifetime
+// (tasks are recreated on every state transition, so there's no need for
+// runtime sink branching -- see docs/architecture.md "Task lifecycle").
+// Returns ESP_OK once both are running.
+esp_err_t sysstats_pipeline_start(sysstats_sink_t sink);
+
+// Delete stats_producer_task + stats_writer_task and stats_queue.
+void sysstats_pipeline_stop(void);

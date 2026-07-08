@@ -1,14 +1,22 @@
 #include "sysstats.h"
 
 #include <string.h>
+#include <stdio.h>
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 #include "driver/temperature_sensor.h"
+
+#include "config.h"
+#include "imu.h"
+#include "camera.h"
+#include "net_client.h"
+#include "sdcard.h"
 
 static const char *TAG = "STATS";
 
@@ -29,6 +37,11 @@ static uint32_t s_prev_idle1_us = 0;    // IDLE1 cumulative runtime at prev snap
 static bool     s_have_baseline = false;
 
 static temperature_sensor_handle_t s_temp = NULL;
+
+static QueueHandle_t s_stats_queue     = NULL;
+static TaskHandle_t  s_producer_handle = NULL;
+static TaskHandle_t  s_writer_handle   = NULL;
+static sysstats_sink_t s_sink;
 
 // Read the cumulative runtime of the two idle tasks. Returns false if the
 // FreeRTOS trace facility is unavailable or the tasks were not found.
@@ -82,7 +95,7 @@ static void fill_cpu_load(sysstats_snapshot_t *s, int64_t now_us) {
     s_prev_idle1_us = idle1;
 }
 
-static void fill_snapshot(sysstats_snapshot_t *s) {
+void sysstats_fill(sysstats_snapshot_t *s) {
     memset(s, 0, sizeof(*s));
     int64_t now_us = esp_timer_get_time();
     s->esp_us   = now_us;
@@ -137,26 +150,120 @@ esp_err_t sysstats_start(void) {
     return ESP_OK;
 }
 
-size_t sysstats_serialize(uint8_t *out) {
-    sysstats_snapshot_t s;
-    fill_snapshot(&s);
-
+size_t sysstats_serialize_snapshot(const sysstats_snapshot_t *s, uint8_t *out) {
     // Field-by-field, little-endian, no padding — mirror in wire.py.
     uint8_t *p = out;
-    memcpy(p, &s.esp_us,         8); p += 8;
-    memcpy(p, &s.cpu0_load,      4); p += 4;
-    memcpy(p, &s.cpu1_load,      4); p += 4;
-    memcpy(p, &s.chip_temp_c,    4); p += 4;
-    memcpy(p, &s.wifi_rssi,      4); p += 4;
-    memcpy(p, &s.uptime_s,       4); p += 4;
-    memcpy(p, &s.heap_free,      4); p += 4;
-    memcpy(p, &s.heap_min_free,  4); p += 4;
-    memcpy(p, &s.int_free,       4); p += 4;
-    memcpy(p, &s.int_largest,    4); p += 4;
-    memcpy(p, &s.int_total,      4); p += 4;
-    memcpy(p, &s.psram_free,     4); p += 4;
-    memcpy(p, &s.psram_min_free, 4); p += 4;
-    memcpy(p, &s.psram_largest,  4); p += 4;
-    memcpy(p, &s.psram_total,    4); p += 4;
+    memcpy(p, &s->esp_us,         8); p += 8;
+    memcpy(p, &s->cpu0_load,      4); p += 4;
+    memcpy(p, &s->cpu1_load,      4); p += 4;
+    memcpy(p, &s->chip_temp_c,    4); p += 4;
+    memcpy(p, &s->wifi_rssi,      4); p += 4;
+    memcpy(p, &s->uptime_s,       4); p += 4;
+    memcpy(p, &s->heap_free,      4); p += 4;
+    memcpy(p, &s->heap_min_free,  4); p += 4;
+    memcpy(p, &s->int_free,       4); p += 4;
+    memcpy(p, &s->int_largest,    4); p += 4;
+    memcpy(p, &s->int_total,      4); p += 4;
+    memcpy(p, &s->psram_free,     4); p += 4;
+    memcpy(p, &s->psram_min_free, 4); p += 4;
+    memcpy(p, &s->psram_largest,  4); p += 4;
+    memcpy(p, &s->psram_total,    4); p += 4;
     return (size_t)(p - out);
+}
+
+size_t sysstats_snapshot_to_json(const sysstats_snapshot_t *s, char *out, size_t out_sz) {
+    // Queue depth/overflow counters are only surfaced here (SD JSON), not in
+    // the wire payload above -- that layout is fixed by software/host_server.
+    int n = snprintf(out, out_sz,
+        "{\"esp_us\":%lld,\"cpu0_load\":%.2f,\"cpu1_load\":%.2f,"
+        "\"chip_temp_c\":%.2f,\"wifi_rssi\":%d,\"uptime_s\":%u,"
+        "\"heap_free\":%u,\"heap_min_free\":%u,"
+        "\"int_free\":%u,\"int_largest\":%u,\"int_total\":%u,"
+        "\"psram_free\":%u,\"psram_min_free\":%u,\"psram_largest\":%u,\"psram_total\":%u,"
+        "\"imu_queue_depth\":%u,\"imu_queue_overflows\":%u,"
+        "\"camera_queue_depth\":%u,\"camera_queue_overflows\":%u}",
+        (long long)s->esp_us, s->cpu0_load, s->cpu1_load,
+        s->chip_temp_c, (int)s->wifi_rssi, (unsigned)s->uptime_s,
+        (unsigned)s->heap_free, (unsigned)s->heap_min_free,
+        (unsigned)s->int_free, (unsigned)s->int_largest, (unsigned)s->int_total,
+        (unsigned)s->psram_free, (unsigned)s->psram_min_free,
+        (unsigned)s->psram_largest, (unsigned)s->psram_total,
+        (unsigned)imu_queue_depth(), (unsigned)imu_queue_overflow_count(),
+        (unsigned)camera_queue_depth(), (unsigned)camera_queue_overflow_count());
+    return n > 0 ? (size_t)n : 0;
+}
+
+// --------------------------------------------------------------------------
+// Stats pipeline
+// --------------------------------------------------------------------------
+
+static void stats_producer_task(void *arg) {
+    TickType_t last_wake = xTaskGetTickCount();
+    while (1) {
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(CONFIG_STATS_PRODUCER_PERIOD_MS));
+
+        sysstats_snapshot_t snap;
+        sysstats_fill(&snap);
+
+        if (xQueueSend(s_stats_queue, &snap, 0) != pdTRUE) {
+            sysstats_snapshot_t discard;
+            xQueueReceive(s_stats_queue, &discard, 0);
+            xQueueSend(s_stats_queue, &snap, 0);
+            ESP_LOGW(TAG, "stats_queue full, dropped oldest snapshot");
+        }
+    }
+}
+
+static void stats_writer_task(void *arg) {
+    TickType_t last_wake = xTaskGetTickCount();
+    while (1) {
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(CONFIG_STATS_CONSUMER_PERIOD_MS));
+
+        sysstats_snapshot_t snap;
+        if (xQueueReceive(s_stats_queue, &snap, 0) != pdTRUE) continue;
+
+        if (s_sink == SYSSTATS_SINK_WIFI) {
+            uint8_t wire[SYSSTATS_WIRE_LEN];
+            sysstats_serialize_snapshot(&snap, wire);
+            net_client_send_stats(wire, SYSSTATS_WIRE_LEN);
+        } else {
+            char json[384];
+            size_t n = sysstats_snapshot_to_json(&snap, json, sizeof(json));
+            sdcard_write_stats((const uint8_t *)json, n);
+        }
+    }
+}
+
+esp_err_t sysstats_pipeline_start(sysstats_sink_t sink) {
+    s_sink = sink;
+    s_stats_queue = xQueueCreate(CONFIG_STATS_QUEUE_LEN, sizeof(sysstats_snapshot_t));
+    if (!s_stats_queue) return ESP_ERR_NO_MEM;
+
+    if (xTaskCreatePinnedToCore(stats_producer_task, "stats_prod", 4096, NULL,
+                                CONFIG_STATS_PRODUCER_PRIORITY, &s_producer_handle,
+                                CONFIG_STATS_PRODUCER_CORE) != pdPASS) {
+        vQueueDelete(s_stats_queue);
+        s_stats_queue = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (xTaskCreatePinnedToCore(stats_writer_task, "stats_wr", 4096, NULL,
+                                CONFIG_STATS_CONSUMER_PRIORITY, &s_writer_handle,
+                                CONFIG_STATS_CONSUMER_CORE) != pdPASS) {
+        vTaskDelete(s_producer_handle);
+        s_producer_handle = NULL;
+        vQueueDelete(s_stats_queue);
+        s_stats_queue = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(TAG, "stats pipeline started (sink=%s)",
+             sink == SYSSTATS_SINK_WIFI ? "wifi" : "sdcard");
+    return ESP_OK;
+}
+
+void sysstats_pipeline_stop(void) {
+    if (s_producer_handle) { vTaskDelete(s_producer_handle); s_producer_handle = NULL; }
+    if (s_writer_handle)   { vTaskDelete(s_writer_handle);   s_writer_handle   = NULL; }
+    if (s_stats_queue)     { vQueueDelete(s_stats_queue);    s_stats_queue     = NULL; }
 }

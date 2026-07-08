@@ -1,22 +1,28 @@
+#include <stdbool.h>
+#include <time.h>
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
+#include "esp_netif_sntp.h"
 #include "nvs_flash.h"
-#include "mdns.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 
 #include "config.h"
 #include "camera.h"
 #include "imu.h"
 #include "sysstats.h"
-#include "server_local.h"
-#include "net_client.h"
 #include "sdcard.h"
+#include "state_machine.h"
 
 static const char *TAG = "SLAM";
 
 // --------------------------------------------------------------------------
 // WiFi (STA)
 // --------------------------------------------------------------------------
+
+#define WIFI_CONNECTED_BIT BIT0
+static EventGroupHandle_t s_wifi_event_group;
 
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                 int32_t id, void *data) {
@@ -25,17 +31,13 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "IP: " IPSTR, IP2STR(&e->ip_info.ip));
-#if CONFIG_ENABLE_LOCAL_SERVER
-        ESP_LOGI(TAG, "http://" IPSTR "  or  http://slam-cam.local", IP2STR(&e->ip_info.ip));
-        mdns_init();
-        mdns_hostname_set("slam-cam");
-        mdns_instance_name_set("ESP32-S3 SLAM Camera");
-        mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
-#endif
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
 
 static void wifi_start(void) {
+    s_wifi_event_group = xEventGroupCreate();
+
     esp_netif_init();
     esp_event_loop_create_default();
     esp_netif_create_default_wifi_sta();
@@ -61,32 +63,56 @@ static void wifi_start(void) {
 }
 
 // --------------------------------------------------------------------------
-// Entry point — capture (camera + IMU) is always on; the data sink(s) are
-// selected in config.h.
+// Wall-clock time (SNTP) — the ESP32-S3 has no battery-backed RTC, so on
+// every boot the clock starts at the epoch until synced over the network.
+// sdcard.c uses time(NULL) to name each session folder "YYYYMMDD-HHMMSS";
+// without this, that would just be 19700101-000000 every boot.
+// --------------------------------------------------------------------------
+
+static void sync_time(void) {
+    ESP_LOGI(TAG, "syncing time via SNTP...");
+    esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    esp_netif_sntp_init(&sntp_cfg);
+    if (esp_netif_sntp_sync_wait(pdMS_TO_TICKS(10000)) != ESP_OK) {
+        ESP_LOGW(TAG, "SNTP sync timed out — session folder will fall back to a boot-relative name");
+        return;
+    }
+    time_t now = time(NULL);
+    struct tm tm_info;
+    localtime_r(&now, &tm_info);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_info);
+    ESP_LOGI(TAG, "time synced (UTC): %s", buf);
+}
+
+// --------------------------------------------------------------------------
+// Entry point — brings up WiFi + the camera/IMU/SD hardware once, then hands
+// off to main_state_machine_task, which creates/tears down the actual
+// capture pipelines at runtime based on serial commands (see
+// docs/architecture.md "Runtime state machine").
 // --------------------------------------------------------------------------
 
 void app_main(void) {
     nvs_flash_init();
     wifi_start();
 
-    if (camera_start() != ESP_OK) return;
-    if (imu_start() != ESP_OK) return;
+    if (xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE,
+                             pdMS_TO_TICKS(10000)) & WIFI_CONNECTED_BIT) {
+        sync_time();
+    } else {
+        ESP_LOGW(TAG, "WiFi not connected within 10s — skipping time sync");
+    }
+
+    if (camera_init() != ESP_OK) return;
+    if (imu_init() != ESP_OK) return;
     sysstats_start();  // best-effort telemetry; failure is non-fatal
 
+    bool sdcard_available = false;
 #if CONFIG_USE_SDCARD
-    if (sdcard_start() != ESP_OK)
+    sdcard_available = (sdcard_init() == ESP_OK);
+    if (!sdcard_available)
         ESP_LOGW(TAG, "SD card logging unavailable — continuing without it");
 #endif
 
-#if CONFIG_ENABLE_LOCAL_SERVER
-    server_local_start();
-#endif
-
-#if CONFIG_ENABLE_REMOTE_STREAM
-    net_client_start(CONFIG_REMOTE_HOST, CONFIG_REMOTE_PORT, CONFIG_REMOTE_STREAM_FPS);
-#endif
-
-#if !CONFIG_ENABLE_LOCAL_SERVER && !CONFIG_ENABLE_REMOTE_STREAM && !CONFIG_USE_SDCARD
-    ESP_LOGW(TAG, "no data sink enabled — capturing but not transmitting");
-#endif
+    state_machine_start(sdcard_available);
 }

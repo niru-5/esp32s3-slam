@@ -3,7 +3,7 @@
         {
             "name": "ESP-IDF",
             // "compileCommands": "${workspaceFolder}/firmware/data_capture/build/compile_commands.json",
-            "compileCommands": "${workspaceFolder}/firmware/imu_testing/build/compile_commands.json",
+            "compileCommands": "${workspaceFolder}/firmware/data_capture/build/compile_commands.json",
             "configurationProvider": "ms-vscode.cmake-tools"
         }
     ],

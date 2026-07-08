@@ -1,7 +1,6 @@
 #include "imu.h"
 
 #include <string.h>
-#include <stdlib.h>
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_rom_sys.h"
@@ -9,8 +8,9 @@
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/semphr.h"
+#include "freertos/queue.h"
 
+#include "config.h"
 #include "bmi270.h"
 
 // --------------------------------------------------------------------------
@@ -28,21 +28,14 @@
 
 static const char *TAG = "IMU";
 
-static imu_sample_t      s_imu_ring[IMU_RING_CAP];
-static uint32_t          s_imu_write = 0;   // index of next write slot
-static uint32_t          s_imu_count = 0;   // valid samples in ring
-static SemaphoreHandle_t s_imu_mutex;
+static struct bmi2_dev s_bmi2;
+static float           s_raw_to_gs;       // int16 → g
+static float           s_raw_to_dps;      // int16 → deg/s
 
-// Second ring fed by the same imu_task(), drained independently via
-// imu_sdlog_drain() — see the comment on that declaration in imu.h.
-static imu_sample_t      s_imu_sdlog_ring[IMU_RING_CAP];
-static uint32_t          s_imu_sdlog_write = 0;
-static uint32_t          s_imu_sdlog_count = 0;
-static SemaphoreHandle_t s_imu_sdlog_mutex;
-
-static struct bmi2_dev   s_bmi2;
-static float             s_raw_to_gs;       // int16 → g
-static float             s_raw_to_dps;      // int16 → deg/s
+static QueueHandle_t      s_imu_queue          = NULL;
+static esp_timer_handle_t s_capture_timer      = NULL;
+static TaskHandle_t       s_capture_task_handle = NULL;
+static uint32_t           s_overflow_count      = 0;
 
 // --------------------------------------------------------------------------
 // BMI2 I2C read/write/delay callbacks
@@ -177,10 +170,15 @@ static esp_err_t bmi270_bringup(void) {
         return ESP_FAIL;
     }
 
-    config[0].cfg.acc.odr   = BMI2_ACC_ODR_100HZ;
+    // ODR raised from 100Hz to 1600Hz (the BMI270's native rate closest to
+    // and above our CONFIG_IMU_CAPTURE_PERIOD_MS=1ms capture cadence -- ODR
+    // steps are powers of two, "1kHz" isn't one of them, and polling faster
+    // than the sensor updates would just re-read stale samples). See
+    // docs/architecture.md open questions.
+    config[0].cfg.acc.odr   = BMI2_ACC_ODR_1600HZ;
     config[0].cfg.acc.range = BMI2_ACC_RANGE_4G;
 
-    config[1].cfg.gyr.odr   = BMI2_GYR_ODR_100HZ;
+    config[1].cfg.gyr.odr   = BMI2_GYR_ODR_1600HZ;
     config[1].cfg.gyr.range = BMI2_GYR_RANGE_500;
 
     err = bmi270_set_sensor_config(config, 2, &s_bmi2);
@@ -195,22 +193,24 @@ static esp_err_t bmi270_bringup(void) {
     // gyro: raw int16 * scalar → deg/s  (BMI2_GYR_RANGE_125 = 4)
     s_raw_to_dps = (125.0f * (float)(1 << (BMI2_GYR_RANGE_125 - config[1].cfg.gyr.range))) / 32768.0f;
 
-    ESP_LOGI(TAG, "BMI270 ready — accel ±%dG  gyro ±%ddps  ODR 100Hz",
+    ESP_LOGI(TAG, "BMI270 ready — accel ±%dG  gyro ±%ddps  ODR 1600Hz",
              (int)(2 << config[0].cfg.acc.range),
              (int)(125 * (1 << (BMI2_GYR_RANGE_125 - config[1].cfg.gyr.range))));
     return ESP_OK;
 }
 
 // --------------------------------------------------------------------------
-// IMU task — 100 Hz
-// Stores raw sensor timestamp per sample; host applies clock offset at read.
-// NOTE: for reliable 10 ms tick, set CONFIG_FREERTOS_HZ=1000 in sdkconfig.
+// imu_capture_task — woken by esp_timer every CONFIG_IMU_CAPTURE_PERIOD_MS
+// via task-notify (see imu.h for why not a FreeRTOS software timer).
 // --------------------------------------------------------------------------
 
-static void imu_task(void *arg) {
-    TickType_t last_wake = xTaskGetTickCount();
+static void capture_timer_cb(void *arg) {
+    xTaskNotifyGive(s_capture_task_handle);
+}
+
+static void imu_capture_task(void *arg) {
     while (1) {
-        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(10));
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
         struct bmi2_sens_data raw;
         memset(&raw, 0, sizeof(raw));
@@ -226,17 +226,17 @@ static void imu_task(void *arg) {
             .gz = (float)raw.gyr.z * s_raw_to_dps,
         };
 
-        xSemaphoreTake(s_imu_mutex, portMAX_DELAY);
-        s_imu_ring[s_imu_write] = s;
-        s_imu_write = (s_imu_write + 1) % IMU_RING_CAP;
-        if (s_imu_count < IMU_RING_CAP) s_imu_count++;
-        xSemaphoreGive(s_imu_mutex);
-
-        xSemaphoreTake(s_imu_sdlog_mutex, portMAX_DELAY);
-        s_imu_sdlog_ring[s_imu_sdlog_write] = s;
-        s_imu_sdlog_write = (s_imu_sdlog_write + 1) % IMU_RING_CAP;
-        if (s_imu_sdlog_count < IMU_RING_CAP) s_imu_sdlog_count++;
-        xSemaphoreGive(s_imu_sdlog_mutex);
+        // Producer never blocks on a full queue (a slow consumer must not
+        // stall a priority-22 task) -- drop the oldest sample to make room.
+        if (xQueueSend(s_imu_queue, &s, 0) != pdTRUE) {
+            imu_sample_t discard;
+            xQueueReceive(s_imu_queue, &discard, 0);
+            xQueueSend(s_imu_queue, &s, 0);
+            s_overflow_count++;
+            if (s_overflow_count % 100 == 1)  // don't flood the log at 1kHz
+                ESP_LOGW(TAG, "imu_queue full, dropped oldest (overflow #%lu)",
+                         (unsigned long)s_overflow_count);
+        }
     }
 }
 
@@ -244,78 +244,94 @@ static void imu_task(void *arg) {
 // Public API
 // --------------------------------------------------------------------------
 
-esp_err_t imu_start(void) {
-    s_imu_mutex = xSemaphoreCreateMutex();
-    s_imu_sdlog_mutex = xSemaphoreCreateMutex();
-    if (!s_imu_mutex || !s_imu_sdlog_mutex) return ESP_ERR_NO_MEM;
-
+esp_err_t imu_init(void) {
     esp_err_t err = bmi270_bringup();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "IMU init failed — check wiring (SDA=GPIO%d SCL=GPIO%d addr=0x%02X)",
                  IMU_SDA_GPIO, IMU_SCL_GPIO, BMI270_ADDR);
-        return err;
+    }
+    return err;
+}
+
+esp_err_t imu_pipeline_start(void) {
+    s_overflow_count = 0;
+    s_imu_queue = xQueueCreate(CONFIG_IMU_QUEUE_LEN, sizeof(imu_sample_t));
+    if (!s_imu_queue) return ESP_ERR_NO_MEM;
+
+    if (xTaskCreatePinnedToCore(imu_capture_task, "imu_cap", 4096, NULL,
+                                CONFIG_IMU_CAPTURE_PRIORITY, &s_capture_task_handle,
+                                CONFIG_IMU_CAPTURE_CORE) != pdPASS) {
+        vQueueDelete(s_imu_queue);
+        s_imu_queue = NULL;
+        return ESP_ERR_NO_MEM;
     }
 
-    // Pinned to core 1 so camera/WiFi (core 0) stays uncontended.
-    if (xTaskCreatePinnedToCore(imu_task, "imu", 4096, NULL, 5, NULL, 1) != pdPASS)
-        return ESP_ERR_NO_MEM;
+    const esp_timer_create_args_t timer_args = {
+        .callback = capture_timer_cb,
+        .name     = "imu_cap_timer",
+    };
+    if (esp_timer_create(&timer_args, &s_capture_timer) != ESP_OK ||
+        esp_timer_start_periodic(s_capture_timer, CONFIG_IMU_CAPTURE_PERIOD_MS * 1000ULL) != ESP_OK) {
+        vTaskDelete(s_capture_task_handle);
+        s_capture_task_handle = NULL;
+        vQueueDelete(s_imu_queue);
+        s_imu_queue = NULL;
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "capture pipeline started (%d ms period, queue depth %d)",
+             CONFIG_IMU_CAPTURE_PERIOD_MS, CONFIG_IMU_QUEUE_LEN);
     return ESP_OK;
 }
 
-// Snapshot `ring` into `out` and clear it. Shared by imu_drain() and
-// imu_sdlog_drain() — the two rings are otherwise independent.
-static uint32_t ring_drain(imu_sample_t *ring, uint32_t *write, uint32_t *count,
-                            SemaphoreHandle_t mutex, imu_sample_t *out) {
-    xSemaphoreTake(mutex, portMAX_DELAY);
-    uint32_t n      = *count;
-    uint32_t oldest = (*write + IMU_RING_CAP - n) % IMU_RING_CAP;
-    for (uint32_t i = 0; i < n; i++)
-        out[i] = ring[(oldest + i) % IMU_RING_CAP];
-    *count = 0;
-    *write = 0;
-    xSemaphoreGive(mutex);
-    return n;
+void imu_pipeline_stop(void) {
+    if (s_capture_timer) {
+        esp_timer_stop(s_capture_timer);
+        esp_timer_delete(s_capture_timer);
+        s_capture_timer = NULL;
+    }
+    if (s_capture_task_handle) {
+        vTaskDelete(s_capture_task_handle);
+        s_capture_task_handle = NULL;
+    }
+    if (s_imu_queue) {
+        vQueueDelete(s_imu_queue);
+        s_imu_queue = NULL;
+    }
 }
 
-// Reference pair — taken right after clearing a ring so the offset applies to
-// the samples just snapshotted from it.
-static void capture_ref(int64_t *ref_esp_us, uint32_t *ref_sensor_ticks) {
+uint32_t imu_queue_drain(imu_sample_t *out, uint32_t max_count,
+                         int64_t *ref_esp_us, uint32_t *ref_sensor_ticks) {
+    uint32_t n = 0;
+    if (s_imu_queue) {
+        while (n < max_count && xQueueReceive(s_imu_queue, &out[n], 0) == pdTRUE) n++;
+    }
+
+    // Reference pair for the batch just drained -- a fresh BMI270 read taken
+    // right now. The shared-clock math only needs *a* known (esp_us, tick)
+    // instant, not one per sample.
     struct bmi2_sens_data ref;
     memset(&ref, 0, sizeof(ref));
     bmi2_get_sensor_data(&ref, &s_bmi2);
     if (ref_esp_us)       *ref_esp_us       = esp_timer_get_time();
     if (ref_sensor_ticks) *ref_sensor_ticks = ref.sens_time;
+    return n;
 }
 
-uint32_t imu_drain(imu_sample_t *out, int64_t *ref_esp_us,
-                   uint32_t *ref_sensor_ticks) {
-    uint32_t count = ring_drain(s_imu_ring, &s_imu_write, &s_imu_count, s_imu_mutex, out);
-    capture_ref(ref_esp_us, ref_sensor_ticks);
-    return count;
+uint32_t imu_queue_depth(void) {
+    return s_imu_queue ? (uint32_t)uxQueueMessagesWaiting(s_imu_queue) : 0;
 }
 
-uint32_t imu_sdlog_drain(imu_sample_t *out, int64_t *ref_esp_us,
-                         uint32_t *ref_sensor_ticks) {
-    uint32_t count = ring_drain(s_imu_sdlog_ring, &s_imu_sdlog_write, &s_imu_sdlog_count,
-                                 s_imu_sdlog_mutex, out);
-    capture_ref(ref_esp_us, ref_sensor_ticks);
-    return count;
+uint32_t imu_queue_overflow_count(void) {
+    return s_overflow_count;
 }
 
-size_t imu_serialize(uint8_t *out) {
-    // Heap, not stack — IMU_RING_CAP samples is ~5.6 KB, larger than the httpd
-    // task stack. Fall back to draining an empty payload on OOM.
-    imu_sample_t *samples = malloc(IMU_RING_CAP * sizeof(imu_sample_t));
-    int64_t  ref_esp_us = esp_timer_get_time();
-    uint32_t ref_sensor_ticks = 0;
-    uint32_t count = 0;
-    if (samples)
-        count = imu_drain(samples, &ref_esp_us, &ref_sensor_ticks);
-
+size_t imu_serialize_wire(const imu_sample_t *samples, uint32_t count,
+                          int64_t ref_esp_us, uint32_t ref_ticks, uint8_t *out) {
     uint8_t *p = out;
-    memcpy(p, &count,            4); p += 4;
-    memcpy(p, &ref_esp_us,       8); p += 8;
-    memcpy(p, &ref_sensor_ticks, 4); p += 4;
+    memcpy(p, &count,      4); p += 4;
+    memcpy(p, &ref_esp_us, 8); p += 8;
+    memcpy(p, &ref_ticks,  4); p += 4;
     for (uint32_t i = 0; i < count; i++) {
         memcpy(p, &samples[i].sens_time, 4); p += 4;
         memcpy(p, &samples[i].ax,        4); p += 4;
@@ -325,17 +341,5 @@ size_t imu_serialize(uint8_t *out) {
         memcpy(p, &samples[i].gy,        4); p += 4;
         memcpy(p, &samples[i].gz,        4); p += 4;
     }
-    free(samples);
     return (size_t)(p - out);
-}
-
-uint32_t imu_peek_latest(imu_sample_t *out) {
-    xSemaphoreTake(s_imu_mutex, portMAX_DELAY);
-    uint32_t count = s_imu_count;
-    if (count > 0)
-        *out = s_imu_ring[(s_imu_write + IMU_RING_CAP - 1) % IMU_RING_CAP];
-    else
-        memset(out, 0, sizeof(*out));
-    xSemaphoreGive(s_imu_mutex);
-    return count;
 }

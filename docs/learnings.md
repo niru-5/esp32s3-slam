@@ -291,6 +291,72 @@ safe headroom given this board's 16 MB flash (N16R8).
 
 ---
 
+## 12. USB-Serial-JTAG console: log output works instantly, `stdin` silently never does
+
+**Symptom:** `main_state_machine_task` polls `stdin` non-blockingly every 500ms and looks
+completely healthy (a heartbeat log every tick proved the task itself was running fine),
+but sending any byte over the port — `1`, `2`, any character — was never seen: no
+`fgetc()` in the poll loop ever returned anything but `EOF`, indefinitely. This first
+presented as what looked like a total system hang right after sending a command (nothing
+printed for 10+ seconds), and burned a lot of time chasing task-priority/stack-overflow/
+esp_timer theories before a heartbeat log proved the task was ticking the whole time —
+it just never saw the byte.
+
+**Cause:** this board exposes two USB-C ports — a "USB-OTG" port (the ESP32-S3's native
+USB peripheral, appears as `/dev/ttyACM0`, also carries JTAG) and a separate "USB-UART"
+port (a USB-to-UART bridge wired to the real UART0 pins). `sdkconfig` had
+`CONFIG_ESP_CONSOLE_UART_DEFAULT=y` — UART0 as the **primary** console (the one bound to
+`stdin`) — with USB-Serial-JTAG only as a **secondary**, output-only mirror (for boot-log
+visibility over USB even when the primary is a UART nobody's watching). Connected via the
+OTG port (needed for JTAG), every log line still appeared (secondary mirrors output
+fine), but bytes typed into that port had nowhere to go — `stdin` was listening on UART0,
+whose pins aren't wired to this port at all.
+
+Switching the primary console to `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` was *necessary
+but not sufficient*: log output kept working (USB-Serial-JTAG's default VFS mode already
+handles TX + a simple/limited RX path used automatically), but `stdin` reads still
+silently stayed empty. The remaining piece: `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG` alone
+does not install the full interrupt-driven USB-Serial-JTAG driver — that install is
+**not called anywhere in ESP-IDF's own startup path** (confirmed by grepping
+`esp_system`/`vfs`/`esp_driver_usb_serial_jtag` — the only callers in the whole SDK tree
+are that driver's own test apps). Without it, incoming USB OUT (host→device) transfers
+are never serviced, so every byte sent is dropped at the USB level before it ever reaches
+`stdin` — not a buffering or timing issue, the byte truly never arrives anywhere in the
+firmware.
+
+**Fix:** two parts.
+1. `sdkconfig`: `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` (primary), `CONFIG_ESP_CONSOLE_SECONDARY_NONE=y`
+   (drop the UART0-primary / USB-secondary split entirely).
+2. In code, before the first `stdin` read (`state_machine.c::main_state_machine_task`):
+   ```c
+   #include "driver/usb_serial_jtag.h"
+   #include "driver/usb_serial_jtag_vfs.h"
+
+   usb_serial_jtag_driver_config_t usj_cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+   usb_serial_jtag_driver_install(&usj_cfg);
+   usb_serial_jtag_vfs_use_driver();   // switches stdin/stdout to the interrupt-driven driver
+
+   // usb_serial_jtag_vfs_use_driver() makes reads blocking — reapply O_NONBLOCK
+   // so fgetc() returns EOF immediately instead of blocking the task.
+   int flags = fcntl(fileno(stdin), F_GETFL, 0);
+   fcntl(fileno(stdin), F_SETFL, flags | O_NONBLOCK);
+   ```
+
+**How this was actually diagnosed** (worth reusing next time input silently vanishes):
+add a heartbeat log to the suspected task's loop (`ESP_LOGI("tick %lu", n++)` every
+iteration) *before* assuming a hang. If the heartbeat keeps ticking right through the
+moment input was sent, the task is alive and the bug is in the input path specifically,
+not a crash/deadlock — which redirects debugging effort immediately instead of chasing
+task-priority or stack-overflow theories that a live heartbeat already rules out.
+
+**General rule:** on boards with two USB connectors (native USB/OTG+JTAG vs a
+UART-bridge), decide which one owns the *interactive* console up front, and remember that
+selecting a console peripheral via `CONFIG_ESP_CONSOLE_*` only guarantees log **output**
+works — interactive **input** over USB-Serial-JTAG additionally needs the driver
+installed and switched to explicitly in application code.
+
+---
+
 ## TL;DR checklist: data_capture streaming is slow / SD card won't mount
 1. Network POST taking 100s of ms and it's not obviously the WiFi signal (check RSSI via
    `/stats`)? → try `WIFI_PS_NONE` first, but don't stop there.

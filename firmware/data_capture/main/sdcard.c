@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -18,6 +19,7 @@
 #include "config.h"
 #include "camera.h"
 #include "imu.h"
+#include "debug_time.h"
 
 static const char *TAG = "SDCARD";
 
@@ -26,34 +28,79 @@ static const char *TAG = "SDCARD";
 // Batches physical flash writes instead of one syscall per small fwrite() —
 // see the CONFIG_DEBUG_TIME session notes on why tiny unbatched SD writes
 // are ~80x slower than large sequential ones.
-#define SD_IO_BUFSZ            8192
-#define SD_IMU_DUMP_PERIOD_US  (1000 * 1000)  // one JSON dump per second
+#define SD_IO_BUFSZ 8192
 
 static char s_session_dir[48];
+static char s_imu_dir[56];
+static char s_camera_dir[56];
+static char s_stats_dir[56];
 
-// Find (and create) a fresh session directory. Filenames below are
-// esp_timer-relative (reset to 0 every boot), so without this a second power
-// cycle would silently overwrite the first session's files.
+static TaskHandle_t s_imu_consumer_handle    = NULL;
+static TaskHandle_t s_camera_consumer_handle = NULL;
+
+// Find (and create) a fresh session directory, named from wall-clock time
+// (data_capture.c syncs it over SNTP before sdcard_init runs) so sessions
+// sort chronologically and are identifiable without cross-referencing boot
+// logs. If SNTP never synced (no WiFi / no internet that boot), time(NULL)
+// is still epoch-relative — fall back to a boot-relative name instead of
+// writing every session into "19700101-000000".
 static esp_err_t make_session_dir(void) {
-    for (int i = 0; i < 10000; i++) {
-        snprintf(s_session_dir, sizeof(s_session_dir), SD_MOUNT_POINT "/sess_%04d", i);
-        if (mkdir(s_session_dir, 0775) == 0) return ESP_OK;
+    DEBUG_TIME_START(t0);
+
+    char base[32];
+    time_t now = time(NULL);
+    if (now > 1577836800) {  // > 2020-01-01 => a real sync happened
+        struct tm tm_info;
+        localtime_r(&now, &tm_info);
+        strftime(base, sizeof(base), "%Y%m%d-%H%M%S", &tm_info);
+    } else {
+        ESP_LOGW(TAG, "no wall-clock time available — session folder will use a boot-relative name");
+        snprintf(base, sizeof(base), "boot_%010" PRId64, esp_timer_get_time() / 1000);
+    }
+
+    // Suffix with an index on collision (e.g. two boots within the same
+    // second, or SNTP never synced so every boot hits the same "boot_..."
+    // name only if esp_timer also happened to match, which it won't across
+    // reboots — kept anyway since it's cheap and makes the loop uniform).
+    for (int i = 0; i < 100; i++) {
+        if (i == 0)
+            snprintf(s_session_dir, sizeof(s_session_dir), SD_MOUNT_POINT "/%s", base);
+        else
+            snprintf(s_session_dir, sizeof(s_session_dir), SD_MOUNT_POINT "/%s_%02d", base, i);
+        if (mkdir(s_session_dir, 0775) == 0) {
+            DEBUG_TIME_END(t0, TAG, "make_session_dir");
+            return ESP_OK;
+        }
         if (errno != EEXIST) {
             ESP_LOGE(TAG, "mkdir %s failed: %s", s_session_dir, strerror(errno));
             return ESP_FAIL;
         }
     }
-    ESP_LOGE(TAG, "no free session slot under " SD_MOUNT_POINT " (sess_0000..sess_9999 all exist)");
+    ESP_LOGE(TAG, "no free session slot under " SD_MOUNT_POINT " for base %s", base);
     return ESP_FAIL;
 }
 
-// Save one JPEG frame, named by its capture timestamp to millisecond
-// accuracy (esp_timer microseconds since boot / 1000).
-static void save_frame(int64_t ts_us, const uint8_t *buf, size_t len) {
-    char path[96];
-    snprintf(path, sizeof(path), "%s/frame_%010" PRId64 ".jpg",
-             s_session_dir, ts_us / 1000);
+// Create one <session_dir>/<name> subdirectory, storing its path in *out.
+static esp_err_t make_subdir(const char *name, char *out, size_t out_sz) {
+    snprintf(out, out_sz, "%s/%s", s_session_dir, name);
+    if (mkdir(out, 0775) == 0 || errno == EEXIST) return ESP_OK;
+    ESP_LOGE(TAG, "mkdir %s failed: %s", out, strerror(errno));
+    return ESP_FAIL;
+}
 
+// Save one JPEG frame into <session_dir>/camera/ as frame_<index>_<ts_ms>.jpg:
+// the index is a monotonic per-session counter so files sort in capture order
+// regardless of filesystem listing order, and ts_ms (esp_timer microseconds
+// since boot / 1000) is kept alongside it for precise SLAM-side timing.
+static void save_frame(int64_t ts_us, const uint8_t *buf, size_t len) {
+    static uint32_t s_frame_index = 0;
+    uint32_t idx = s_frame_index++;
+
+    char path[112];
+    snprintf(path, sizeof(path), "%s/frame_%06" PRIu32 "_%010" PRId64 ".jpg",
+             s_camera_dir, idx, ts_us / 1000);
+
+    DEBUG_TIME_START(t0);
     FILE *f = fopen(path, "wb");
     if (!f) {
         ESP_LOGW(TAG, "open %s failed", path);
@@ -62,82 +109,101 @@ static void save_frame(int64_t ts_us, const uint8_t *buf, size_t len) {
     setvbuf(f, NULL, _IOFBF, SD_IO_BUFSZ);
     size_t written = fwrite(buf, 1, len, f);
     fclose(f);
+    DEBUG_TIME_END(t0, TAG, "save_frame");
     if (written != len)
         ESP_LOGW(TAG, "short write on %s (%u/%u bytes)",
                  path, (unsigned)written, (unsigned)len);
 }
 
-// Drain the SD-log IMU ring and write it as a JSON array of
-// {t_ms, ax, ay, az, gx, gy, gz}, one entry per sample. Each sample's
-// timestamp is reconstructed from the ring's reference pair the same way
-// imu.h documents for the network wire format, so files are self-contained.
-static void save_imu_json(void) {
-    imu_sample_t *samples = malloc(IMU_RING_CAP * sizeof(imu_sample_t));
-    if (!samples) {
-        ESP_LOGW(TAG, "out of memory for IMU dump");
-        return;
-    }
+// Write one batch drained from imu_queue into <session_dir>/imu/ as
+// imu_<index>_<ts_ms>.bin: raw bytes in the same wire format used by
+// STREAM_WIFI (imu_serialize_wire() in imu.h/imu.c) rather than JSON text.
+// Per-sample float formatting (fprintf's dtoa path) measurably competed with
+// camera capture for CPU time at 1kHz; a single fwrite() of pre-packed bytes
+// avoids that entirely. software/host_server/wire.py's parse_imu_payload()
+// already decodes this exact layout -- see also tools/parse_imu_bin.py, a
+// standalone copy for reading these files straight off the card.
+static void save_imu_bin(const uint8_t *wire, size_t wire_len) {
+    static uint32_t s_batch_index = 0;
+    uint32_t idx = s_batch_index++;
 
-    int64_t  ref_esp_us = 0;
-    uint32_t ref_ticks  = 0;
-    uint32_t count = imu_sdlog_drain(samples, &ref_esp_us, &ref_ticks);
-    if (count == 0) {
-        free(samples);
-        return;
-    }
+    char path[112];
+    snprintf(path, sizeof(path), "%s/imu_%06" PRIu32 "_%010" PRId64 ".bin",
+             s_imu_dir, idx, esp_timer_get_time() / 1000);
 
-    char path[96];
-    snprintf(path, sizeof(path), "%s/imu_%010" PRId64 ".json",
-             s_session_dir, esp_timer_get_time() / 1000);
-
-    FILE *f = fopen(path, "w");
+    DEBUG_TIME_START(t0);
+    FILE *f = fopen(path, "wb");
     if (!f) {
         ESP_LOGW(TAG, "open %s failed", path);
-        free(samples);
         return;
     }
     setvbuf(f, NULL, _IOFBF, SD_IO_BUFSZ);
-
-    fputc('[', f);
-    for (uint32_t i = 0; i < count; i++) {
-        int32_t delta_ticks = (int32_t)(samples[i].sens_time - ref_ticks);
-        double  t_ms = (double)(ref_esp_us + (int64_t)(delta_ticks * IMU_SENSORTIME_US)) / 1000.0;
-        fprintf(f, "%s{\"t_ms\":%.3f,\"ax\":%.5f,\"ay\":%.5f,\"az\":%.5f,"
-                   "\"gx\":%.4f,\"gy\":%.4f,\"gz\":%.4f}",
-                i == 0 ? "" : ",", t_ms,
-                samples[i].ax, samples[i].ay, samples[i].az,
-                samples[i].gx, samples[i].gy, samples[i].gz);
-    }
-    fputc(']', f);
+    size_t written = fwrite(wire, 1, wire_len, f);
     fclose(f);
-    free(samples);
+    DEBUG_TIME_END(t0, TAG, "save_imu_bin");
+    if (written != wire_len)
+        ESP_LOGW(TAG, "short write on %s (%u/%u bytes)",
+                 path, (unsigned)written, (unsigned)wire_len);
 }
 
-static void sdlog_task(void *arg) {
-    const TickType_t frame_period =
-        pdMS_TO_TICKS(1000 / (CONFIG_SDCARD_FPS > 0 ? CONFIG_SDCARD_FPS : 1));
-    int64_t last_imu_dump_us = 0;
+// --------------------------------------------------------------------------
+// Consumer tasks
+// --------------------------------------------------------------------------
+
+static void imu_sdcard_consumer_task(void *arg) {
+    const size_t max_len = IMU_WIRE_HEADER_LEN + CONFIG_IMU_CONSUMER_BATCH * IMU_WIRE_SAMPLE_LEN;
+    imu_sample_t *samples = malloc(CONFIG_IMU_CONSUMER_BATCH * sizeof(imu_sample_t));
+    uint8_t      *wire    = malloc(max_len);
+    if (!samples || !wire) {
+        ESP_LOGE(TAG, "out of memory for IMU consumer buffers");
+        free(samples); free(wire);
+        vTaskDelete(NULL);
+        return;
+    }
 
     TickType_t last_wake = xTaskGetTickCount();
     while (1) {
-        vTaskDelayUntil(&last_wake, frame_period);
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(CONFIG_IMU_CONSUMER_PERIOD_MS));
 
-        int64_t ts;
-        camera_fb_t *fb = camera_grab(&ts);
-        if (fb) {
-            save_frame(ts, fb->buf, fb->len);
-            camera_release(fb);
-        }
+        int64_t  ref_esp_us;
+        uint32_t ref_ticks;
+        DEBUG_TIME_START(t_drain);
+        uint32_t n = imu_queue_drain(samples, CONFIG_IMU_CONSUMER_BATCH, &ref_esp_us, &ref_ticks);
+        DEBUG_TIME_END(t_drain, TAG, "imu draining");
+        if (n == 0) continue;
 
-        int64_t now = esp_timer_get_time();
-        if (now - last_imu_dump_us >= SD_IMU_DUMP_PERIOD_US) {
-            last_imu_dump_us = now;
-            save_imu_json();
+        size_t wire_len = imu_serialize_wire(samples, n, ref_esp_us, ref_ticks, wire);
+        save_imu_bin(wire, wire_len);
+    }
+}
+
+static void camera_sdcard_consumer_task(void *arg) {
+    camera_frame_t *frames = malloc(CONFIG_CAMERA_QUEUE_LEN * sizeof(camera_frame_t));
+    if (!frames) {
+        ESP_LOGE(TAG, "out of memory for camera consumer buffer");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    TickType_t last_wake = xTaskGetTickCount();
+    while (1) {
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(CONFIG_CAMERA_CONSUMER_PERIOD_MS));
+
+        DEBUG_TIME_START(t_drain);
+        uint32_t n = camera_queue_drain(frames, CONFIG_CAMERA_QUEUE_LEN);
+        DEBUG_TIME_END(t_drain, TAG, "camera draining");
+        for (uint32_t i = 0; i < n; i++) {
+            save_frame(frames[i].ts_us, frames[i].fb->buf, frames[i].fb->len);
+            camera_release(frames[i].fb);
         }
     }
 }
 
-esp_err_t sdcard_start(void) {
+// --------------------------------------------------------------------------
+// Public API
+// --------------------------------------------------------------------------
+
+esp_err_t sdcard_init(void) {
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.flags        = SDMMC_HOST_FLAG_1BIT;   // only CLK/CMD/D0 are wired
     host.max_freq_khz = SDMMC_FREQ_DEFAULT;     // 20 MHz; try _HIGHSPEED once verified stable
@@ -161,8 +227,10 @@ esp_err_t sdcard_start(void) {
     };
 
     sdmmc_card_t *card;
+    DEBUG_TIME_START(t_mount);
     esp_err_t err = esp_vfs_fat_sdmmc_mount(SD_MOUNT_POINT, &host, &slot_config,
                                              &mount_config, &card);
+    DEBUG_TIME_END(t_mount, TAG, "sd mount");
     if (err != ESP_OK) {
         if (err == ESP_FAIL)
             ESP_LOGE(TAG, "mount failed — card isn't FAT-formatted and "
@@ -178,11 +246,65 @@ esp_err_t sdcard_start(void) {
         esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, card);
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "logging to %s", s_session_dir);
 
-    // Shares core 0 with camera/WiFi; kept off core 1 so an occasional SD
-    // write stall (flash wear-leveling) can't jitter the 100 Hz IMU task.
-    if (xTaskCreatePinnedToCore(sdlog_task, "sdlog", 8192, NULL, 5, NULL, 0) != pdPASS)
+    if (make_subdir("imu",    s_imu_dir,    sizeof(s_imu_dir))    != ESP_OK ||
+        make_subdir("camera", s_camera_dir, sizeof(s_camera_dir)) != ESP_OK ||
+        make_subdir("stats",  s_stats_dir,  sizeof(s_stats_dir))  != ESP_OK) {
+        esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, card);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "logging to %s", s_session_dir);
+    return ESP_OK;
+}
+
+esp_err_t sdcard_pipeline_start(void) {
+    if (xTaskCreatePinnedToCore(imu_sdcard_consumer_task, "imu_sd", 8192, NULL,
+                                CONFIG_IMU_CONSUMER_PRIORITY, &s_imu_consumer_handle,
+                                CONFIG_IMU_CONSUMER_CORE) != pdPASS)
         return ESP_ERR_NO_MEM;
+
+    if (xTaskCreatePinnedToCore(camera_sdcard_consumer_task, "cam_sd", 8192, NULL,
+                                CONFIG_CAMERA_CONSUMER_PRIORITY, &s_camera_consumer_handle,
+                                CONFIG_CAMERA_CONSUMER_CORE) != pdPASS) {
+        vTaskDelete(s_imu_consumer_handle);
+        s_imu_consumer_handle = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(TAG, "sdcard consumers started");
+    return ESP_OK;
+}
+
+void sdcard_pipeline_stop(void) {
+    if (s_imu_consumer_handle)    { vTaskDelete(s_imu_consumer_handle);    s_imu_consumer_handle    = NULL; }
+    if (s_camera_consumer_handle) { vTaskDelete(s_camera_consumer_handle); s_camera_consumer_handle = NULL; }
+}
+
+// Write one stats snapshot into <session_dir>/stats/ as
+// stats_<index>_<ts_ms>.json — same per-file naming convention as
+// save_frame/save_imu_json, one file per sample (CONFIG_STATS_*_PERIOD_MS
+// apart) rather than a single appended .jsonl.
+esp_err_t sdcard_write_stats(const uint8_t *json, size_t len) {
+    static uint32_t s_stats_index = 0;
+    uint32_t idx = s_stats_index++;
+
+    char path[112];
+    snprintf(path, sizeof(path), "%s/stats_%06" PRIu32 "_%010" PRId64 ".json",
+             s_stats_dir, idx, esp_timer_get_time() / 1000);
+
+    DEBUG_TIME_START(t0);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        ESP_LOGW(TAG, "open %s failed", path);
+        return ESP_FAIL;
+    }
+    setvbuf(f, NULL, _IOFBF, SD_IO_BUFSZ);
+    size_t written = fwrite(json, 1, len, f);
+    fclose(f);
+    DEBUG_TIME_END(t0, TAG, "sdcard_write_stats");
+    if (written != len)
+        ESP_LOGW(TAG, "short write on %s (%u/%u bytes)",
+                 path, (unsigned)written, (unsigned)len);
     return ESP_OK;
 }

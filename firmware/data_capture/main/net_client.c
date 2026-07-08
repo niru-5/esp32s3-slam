@@ -1,7 +1,6 @@
 #include "net_client.h"
 
 #include <stdlib.h>
-#include <string.h>
 #include "esp_log.h"
 #include "esp_http_client.h"
 #include "esp_timer.h"
@@ -11,138 +10,174 @@
 #include "config.h"
 #include "camera.h"
 #include "imu.h"
-#include "sysstats.h"
 #include "debug_time.h"
 
 static const char *TAG = "NET";
 
-// How often to push a system-stats snapshot (Hz). Kept independent of the
-// frame rate so telemetry cadence is steady even if fps changes.
-#ifndef CONFIG_REMOTE_STATS_HZ
-#define CONFIG_REMOTE_STATS_HZ 1
-#endif
-
+// One persistent esp_http_client per producer -- imu/camera consumers run
+// concurrently on core 0, and a single esp_http_client handle isn't safe to
+// drive from two tasks at once (set_url/set_header/perform on a shared
+// handle from two callers would interleave). A fresh client per POST was the
+// original design and left closed sockets in TIME_WAIT; with
+// LWIP_MAX_ACTIVE_TCP=16 and TCP_MSL=60s that pool exhausted within seconds
+// at this request rate, so each of these keeps one HTTP/1.1 keep-alive
+// connection open instead.
 typedef struct {
-    char     host[64];
-    uint16_t port;
-    int      fps;
-} stream_cfg_t;
+    esp_http_client_handle_t client;
+} net_conn_t;
 
-// Reused across every POST (frame/imu/stats, every cycle) instead of
-// init+cleanup per call. A fresh esp_http_client per POST left the closed
-// socket in TIME_WAIT on the ESP32 side; with LWIP_MAX_ACTIVE_TCP=16 and
-// TCP_MSL=60s, that pool exhausts within seconds at this request rate, and
-// subsequent connects stall waiting for a slot (surfacing as multi-second
-// "sending" times matching CONFIG_LWIP_TCP_RTO_TIME's 1.5s retransmit timer).
-// Keeping one HTTP/1.1 keep-alive connection open avoids the churn entirely.
-static esp_http_client_handle_t s_http_client = NULL;
+static net_conn_t s_frame_conn = {0};
+static net_conn_t s_imu_conn   = {0};
+static net_conn_t s_stats_conn = {0};
 
-// POST a body to http://host:port<path>. `ts_us` (>=0) is sent as the
+static TaskHandle_t s_imu_consumer_handle    = NULL;
+static TaskHandle_t s_camera_consumer_handle = NULL;
+
+// POST a body to http://CONFIG_REMOTE_HOST:CONFIG_REMOTE_PORT<path>, reusing
+// `conn`'s connection across calls. `ts_us` (>=0) is sent as the
 // X-Timestamp-Us header. Returns ESP_OK on a completed request.
-static esp_err_t post_bytes(const stream_cfg_t *cfg, const char *path,
+static esp_err_t post_bytes(net_conn_t *conn, const char *path,
                             const char *content_type,
                             const uint8_t *body, size_t len, int64_t ts_us) {
-    char url[128];
-    snprintf(url, sizeof(url), "http://%s:%u%s", cfg->host, (unsigned)cfg->port, path);
+    char url[96];
+    snprintf(url, sizeof(url), "http://%s:%u%s",
+             CONFIG_REMOTE_HOST, (unsigned)CONFIG_REMOTE_PORT, path);
 
-    if (!s_http_client) {
+    if (!conn->client) {
         esp_http_client_config_t hc = {
             .url        = url,
             .method     = HTTP_METHOD_POST,
             .timeout_ms = 2000,
         };
-        s_http_client = esp_http_client_init(&hc);
-        if (!s_http_client) return ESP_FAIL;
+        conn->client = esp_http_client_init(&hc);
+        if (!conn->client) return ESP_FAIL;
     } else {
-        esp_http_client_set_url(s_http_client, url);
-        esp_http_client_set_method(s_http_client, HTTP_METHOD_POST);
+        esp_http_client_set_url(conn->client, url);
+        esp_http_client_set_method(conn->client, HTTP_METHOD_POST);
     }
 
-    esp_http_client_set_header(s_http_client, "Content-Type", content_type);
+    esp_http_client_set_header(conn->client, "Content-Type", content_type);
     if (ts_us >= 0) {
         char ts_str[24];
         snprintf(ts_str, sizeof(ts_str), "%lld", ts_us);
-        esp_http_client_set_header(s_http_client, "X-Timestamp-Us", ts_str);
+        esp_http_client_set_header(conn->client, "X-Timestamp-Us", ts_str);
     } else {
-        esp_http_client_delete_header(s_http_client, "X-Timestamp-Us");
+        esp_http_client_delete_header(conn->client, "X-Timestamp-Us");
     }
-    esp_http_client_set_post_field(s_http_client, (const char *)body, len);
+    esp_http_client_set_post_field(conn->client, (const char *)body, len);
 
-    esp_err_t err = esp_http_client_perform(s_http_client);
+    esp_err_t err = esp_http_client_perform(conn->client);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "POST %s failed: %s", path, esp_err_to_name(err));
-        // Connection may be wedged — drop it and reconnect fresh next call.
-        esp_http_client_cleanup(s_http_client);
-        s_http_client = NULL;
+        // Connection may be wedged -- drop it and reconnect fresh next call.
+        esp_http_client_cleanup(conn->client);
+        conn->client = NULL;
     }
     return err;
 }
 
-static void stream_task(void *arg) {
-    stream_cfg_t *cfg = (stream_cfg_t *)arg;
-    const TickType_t period = pdMS_TO_TICKS(1000 / (cfg->fps > 0 ? cfg->fps : 1));
+static void close_conn(net_conn_t *conn) {
+    if (conn->client) {
+        esp_http_client_cleanup(conn->client);
+        conn->client = NULL;
+    }
+}
 
-    uint8_t *imu_buf = malloc(IMU_WIRE_MAXLEN);
-    if (!imu_buf) {
-        ESP_LOGE(TAG, "out of memory for IMU buffer");
-        free(cfg);
+// --------------------------------------------------------------------------
+// imu_wifi_consumer_task — drains imu_queue every CONFIG_IMU_CONSUMER_PERIOD_MS
+// and POSTs the batch in the same wire format the ring-buffer drain used to
+// produce (see imu.h).
+// --------------------------------------------------------------------------
+
+static void imu_wifi_consumer_task(void *arg) {
+    const size_t max_len = IMU_WIRE_HEADER_LEN + CONFIG_IMU_CONSUMER_BATCH * IMU_WIRE_SAMPLE_LEN;
+    imu_sample_t *samples = malloc(CONFIG_IMU_CONSUMER_BATCH * sizeof(imu_sample_t));
+    uint8_t      *wire    = malloc(max_len);
+    if (!samples || !wire) {
+        ESP_LOGE(TAG, "out of memory for IMU consumer buffers");
+        free(samples); free(wire);
         vTaskDelete(NULL);
         return;
     }
 
-    ESP_LOGI(TAG, "streaming to http://%s:%u at %d fps",
-             cfg->host, (unsigned)cfg->port, cfg->fps);
+    TickType_t last_wake = xTaskGetTickCount();
+    while (1) {
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(CONFIG_IMU_CONSUMER_PERIOD_MS));
 
-    uint8_t stats_buf[SYSSTATS_WIRE_LEN];
-    const int64_t stats_period_us = 1000000 / (CONFIG_REMOTE_STATS_HZ > 0 ? CONFIG_REMOTE_STATS_HZ : 1);
-    int64_t last_stats_us = 0;
+        int64_t  ref_esp_us;
+        uint32_t ref_ticks;
+        DEBUG_TIME_START(t_cap);
+        uint32_t n = imu_queue_drain(samples, CONFIG_IMU_CONSUMER_BATCH, &ref_esp_us, &ref_ticks);
+        DEBUG_TIME_END(t_cap, TAG, "imu draining");
+        if (n == 0) continue;
+
+        size_t wire_len = imu_serialize_wire(samples, n, ref_esp_us, ref_ticks, wire);
+
+        DEBUG_TIME_START(t_send);
+        post_bytes(&s_imu_conn, "/imu", "application/octet-stream", wire, wire_len, -1);
+        DEBUG_TIME_END(t_send, TAG, "imu sending");
+    }
+}
+
+// --------------------------------------------------------------------------
+// camera_wifi_consumer_task — drains camera_queue every
+// CONFIG_CAMERA_CONSUMER_PERIOD_MS and POSTs each frame.
+// --------------------------------------------------------------------------
+
+static void camera_wifi_consumer_task(void *arg) {
+    camera_frame_t *frames = malloc(CONFIG_CAMERA_QUEUE_LEN * sizeof(camera_frame_t));
+    if (!frames) {
+        ESP_LOGE(TAG, "out of memory for camera consumer buffer");
+        vTaskDelete(NULL);
+        return;
+    }
 
     TickType_t last_wake = xTaskGetTickCount();
     while (1) {
-        vTaskDelayUntil(&last_wake, period);
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(CONFIG_CAMERA_CONSUMER_PERIOD_MS));
 
-        // Frame with its grab timestamp.
-        DEBUG_TIME_START(t_cam_cap);
-        int64_t ts;
-        camera_fb_t *fb = camera_grab(&ts);
-        DEBUG_TIME_END(t_cam_cap, TAG, "camera capturing");
-        if (fb) {
-            DEBUG_TIME_START(t_cam_send);
-            post_bytes(cfg, "/frame", "image/jpeg", fb->buf, fb->len, ts);
-            DEBUG_TIME_END(t_cam_send, TAG, "camera sending");
-            camera_release(fb);
-        }
-
-        // IMU drain since last cycle.
-        DEBUG_TIME_START(t_imu_cap);
-        size_t imu_len = imu_serialize(imu_buf);
-        DEBUG_TIME_END(t_imu_cap, TAG, "imu capturing");
-
-        DEBUG_TIME_START(t_imu_send);
-        post_bytes(cfg, "/imu", "application/octet-stream", imu_buf, imu_len, -1);
-        DEBUG_TIME_END(t_imu_send, TAG, "imu sending");
-
-        // System stats snapshot, throttled to CONFIG_REMOTE_STATS_HZ.
-        int64_t now = esp_timer_get_time();
-        if (now - last_stats_us >= stats_period_us) {
-            last_stats_us = now;
-            size_t stats_len = sysstats_serialize(stats_buf);
-            post_bytes(cfg, "/stats", "application/octet-stream", stats_buf, stats_len, -1);
+        uint32_t n = camera_queue_drain(frames, CONFIG_CAMERA_QUEUE_LEN);
+        for (uint32_t i = 0; i < n; i++) {
+            DEBUG_TIME_START(t_send);
+            post_bytes(&s_frame_conn, "/frame", "image/jpeg",
+                      frames[i].fb->buf, frames[i].fb->len, frames[i].ts_us);
+            DEBUG_TIME_END(t_send, TAG, "camera sending");
+            camera_release(frames[i].fb);
         }
     }
 }
 
-esp_err_t net_client_start(const char *host, uint16_t port, int fps) {
-    stream_cfg_t *cfg = calloc(1, sizeof(stream_cfg_t));
-    if (!cfg) return ESP_ERR_NO_MEM;
-    strncpy(cfg->host, host, sizeof(cfg->host) - 1);
-    cfg->port = port;
-    cfg->fps  = fps;
+// --------------------------------------------------------------------------
+// Public API
+// --------------------------------------------------------------------------
 
-    // Runs on core 0 with WiFi; the IMU sampling task owns core 1.
-    if (xTaskCreatePinnedToCore(stream_task, "net_stream", 8192, cfg, 5, NULL, 0) != pdPASS) {
-        free(cfg);
+esp_err_t net_client_pipeline_start(void) {
+    if (xTaskCreatePinnedToCore(imu_wifi_consumer_task, "imu_wifi", 8192, NULL,
+                                CONFIG_IMU_CONSUMER_PRIORITY, &s_imu_consumer_handle,
+                                CONFIG_IMU_CONSUMER_CORE) != pdPASS)
+        return ESP_ERR_NO_MEM;
+
+    if (xTaskCreatePinnedToCore(camera_wifi_consumer_task, "cam_wifi", 8192, NULL,
+                                CONFIG_CAMERA_CONSUMER_PRIORITY, &s_camera_consumer_handle,
+                                CONFIG_CAMERA_CONSUMER_CORE) != pdPASS) {
+        vTaskDelete(s_imu_consumer_handle);
+        s_imu_consumer_handle = NULL;
         return ESP_ERR_NO_MEM;
     }
+
+    ESP_LOGI(TAG, "wifi consumers started -> http://%s:%u",
+             CONFIG_REMOTE_HOST, (unsigned)CONFIG_REMOTE_PORT);
     return ESP_OK;
+}
+
+void net_client_pipeline_stop(void) {
+    if (s_imu_consumer_handle)    { vTaskDelete(s_imu_consumer_handle);    s_imu_consumer_handle    = NULL; }
+    if (s_camera_consumer_handle) { vTaskDelete(s_camera_consumer_handle); s_camera_consumer_handle = NULL; }
+    close_conn(&s_frame_conn);
+    close_conn(&s_imu_conn);
+    close_conn(&s_stats_conn);
+}
+
+esp_err_t net_client_send_stats(const uint8_t *payload, size_t len) {
+    return post_bytes(&s_stats_conn, "/stats", "application/octet-stream", payload, len, -1);
 }
