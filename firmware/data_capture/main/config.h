@@ -19,6 +19,12 @@
 #define CONFIG_REMOTE_HOST "192.168.178.22"
 #define CONFIG_REMOTE_PORT 8080
 
+// Port the tcp_client.c consumers connect to during STREAM_TCP (raw framed
+// binary stream -- see tcp_client.h). Distinct from CONFIG_REMOTE_PORT since
+// host_server listens for both on the same host but different sockets
+// (HTTP viewer/ingest vs. raw TCP ingest).
+#define CONFIG_REMOTE_TCP_PORT 8081
+
 // --------------------------------------------------------------------------
 // main_state_machine_task — owns the IDLE/STREAM_WIFI/STREAM_SDCARD/
 // CALIBRATION state and creates/deletes the pipelines below on transition.

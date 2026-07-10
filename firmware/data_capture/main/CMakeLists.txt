@@ -7,6 +7,7 @@ idf_component_register(
         "imu.c"
         "sysstats.c"
         "net_client.c"
+        "tcp_client.c"
         "sdcard.c"
         "state_machine.c"
         "${BMI_API}/bmi2.c"

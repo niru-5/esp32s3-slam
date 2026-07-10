@@ -16,6 +16,7 @@
 #include "imu.h"
 #include "camera.h"
 #include "net_client.h"
+#include "tcp_client.h"
 #include "sdcard.h"
 
 static const char *TAG = "STATS";
@@ -226,6 +227,10 @@ static void stats_writer_task(void *arg) {
             uint8_t wire[SYSSTATS_WIRE_LEN];
             sysstats_serialize_snapshot(&snap, wire);
             net_client_send_stats(wire, SYSSTATS_WIRE_LEN);
+        } else if (s_sink == SYSSTATS_SINK_TCP) {
+            uint8_t wire[SYSSTATS_WIRE_LEN];
+            sysstats_serialize_snapshot(&snap, wire);
+            tcp_client_send_stats(wire, SYSSTATS_WIRE_LEN);
         } else {
             char json[384];
             size_t n = sysstats_snapshot_to_json(&snap, json, sizeof(json));
@@ -258,7 +263,8 @@ esp_err_t sysstats_pipeline_start(sysstats_sink_t sink) {
     }
 
     ESP_LOGI(TAG, "stats pipeline started (sink=%s)",
-             sink == SYSSTATS_SINK_WIFI ? "wifi" : "sdcard");
+             sink == SYSSTATS_SINK_WIFI ? "wifi" :
+             sink == SYSSTATS_SINK_TCP  ? "tcp"  : "sdcard");
     return ESP_OK;
 }
 

@@ -44,10 +44,23 @@ machine by setting, in `firmware/data_capture/main/config.h`:
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--host` | `0.0.0.0` | Bind address. |
-| `--port` | `8080` | Listen port (match `CONFIG_REMOTE_PORT`). |
+| `--port` | `8080` | HTTP listen port (match `CONFIG_REMOTE_PORT`). |
+| `--tcp-port` | `8081` | Raw-TCP `STREAM_TCP` ingest port (match `CONFIG_REMOTE_TCP_PORT`). |
 | `--bag`  | `bags/slam_<timestamp>` | rosbag2 output directory. |
 | `--storage` | `sqlite3` | rosbag2 backend (`sqlite3` or `mcap`). |
 | `--no-record` | off | Live view only, no bag. |
+
+## STREAM_TCP (raw socket ingest)
+
+`STREAM_TCP` (serial command `6` on the firmware) is a lower-overhead
+alternative to `STREAM_WIFI`'s HTTP POSTs: one persistent TCP connection
+carries camera frames, IMU batches, and stats snapshots, each wrapped in a
+small `{type, len}` header instead of a full HTTP request per message. This
+server always listens for it on `--tcp-port` (`8081` by default) alongside the
+HTTP server — see [`host_server/tcp_ingest.py`](host_server/tcp_ingest.py) for
+the wire framing. Frames/samples arriving this way feed the same `Hub` and bag
+recorder as the HTTP path, so the live viewer and recorded bag look identical
+regardless of which mode the firmware is in.
 
 ## HTTP endpoints
 
@@ -88,6 +101,7 @@ ros2 bag play bags/slam_<timestamp>
 host_server/
   __main__.py     CLI entry point (python3 -m host_server)
   server.py       threaded http.server: ingest + live view
+  tcp_ingest.py   raw-TCP STREAM_TCP ingest listener (frame/imu/stats framing)
   wire.py         decode the firmware's binary IMU + system-stats payloads
   bag_recorder.py rosbag2 writer (CompressedImage + Imu + DiagnosticArray)
   hub.py          shared latest-frame / latest-IMU / latest-stats state + counters

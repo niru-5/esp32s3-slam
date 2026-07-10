@@ -11,6 +11,7 @@ import threading
 from .bag_recorder import BagRecorder, ros_available, ros_import_error
 from .hub import Hub
 from .server import make_server
+from .tcp_ingest import serve_tcp_ingest
 
 
 def _default_bag_uri() -> str:
@@ -28,6 +29,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="bind address (default: all interfaces)")
     ap.add_argument("--port", type=int, default=8080,
                     help="listen port (must match CONFIG_REMOTE_PORT; default 8080)")
+    ap.add_argument("--tcp-port", type=int, default=8081,
+                    help="raw-TCP STREAM_TCP ingest port (must match "
+                         "CONFIG_REMOTE_TCP_PORT; default 8081)")
     ap.add_argument("--bag", default=None,
                     help="rosbag2 output directory (default: bags/slam_<timestamp>)")
     ap.add_argument("--storage", default="sqlite3", choices=["sqlite3", "mcap"],
@@ -59,21 +63,28 @@ def main(argv: list[str] | None = None) -> int:
           f"(open http://localhost:{args.port}/ in a browser)")
     print(f"[host_server] ROS 2 available: {ros_available()}")
 
-    # Run the blocking server on a worker thread so the main thread can call
-    # server.shutdown() from the signal handler — calling it from within
-    # serve_forever()'s own thread deadlocks.
+    # Run the blocking HTTP server and the raw-TCP ingest listener (STREAM_TCP
+    # mode) each on their own worker thread, sharing `hub`/`recorder`, so the
+    # main thread is free to call their shutdown methods from the signal
+    # handler -- calling shutdown() from within a server's own serving thread
+    # deadlocks.
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
 
-    worker = threading.Thread(target=server.serve_forever, daemon=True)
-    worker.start()
+    http_worker = threading.Thread(target=server.serve_forever, daemon=True)
+    http_worker.start()
+    tcp_worker = threading.Thread(target=serve_tcp_ingest,
+                                  args=(args.host, args.tcp_port, hub, recorder, stop),
+                                  daemon=True)
+    tcp_worker.start()
     try:
         stop.wait()
     finally:
         print("\n[host_server] shutting down…")
         server.shutdown()
         server.server_close()
+        tcp_worker.join(timeout=2.0)
         recorder.close()
         print("[host_server] bag finalized, sockets closed")
     return 0

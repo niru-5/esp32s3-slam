@@ -68,25 +68,27 @@ instead of) serial.
 
 | Serial input | State | Meaning |
 |---|---|---|
-| `1` | `STREAM_WIFI` | start camera+IMU capture, stream to the host over WiFi |
+| `1` | `STREAM_WIFI` | start camera+IMU capture, stream to the host over HTTP (WiFi) |
 | `2` | `STREAM_SDCARD` | start camera+IMU capture, log to the SD card |
-| `3` | `IDLE` | stop streaming (either sink) — tear everything down |
+| `3` | `IDLE` | stop streaming (any sink) — tear everything down |
 | `4` | `IMU_CALIBRATION` | run IMU calibration routine (provisioned only, see below) |
 | `5` | `CAMERA_CALIBRATION` | run camera calibration routine (provisioned only, see below) |
+| `6` | `STREAM_TCP` | start camera+IMU capture, stream to the host over a raw TCP socket (`tcp_client.c`) instead of HTTP |
 
 ### Transition rules
 
-- **`1` ↔ `2` switches directly**, no need to send `3` first. Entering a new state
+- **`1` ↔ `2` ↔ `6` switch directly**, no need to send `3` first. Entering a new state
   implicitly tears down whatever pipeline is currently running (see below) before
   standing up the new one.
-- **`4`/`5` while in `1` or `2`** also force an implicit teardown of the active streaming
-  pipeline before entering the calibration state.
+- **`4`/`5` while in `1`, `2`, or `6`** also force an implicit teardown of the active
+  streaming pipeline before entering the calibration state.
 - Every teardown (`3`, or the implicit teardown on `1`↔`2`/`4`/`5`) **deletes** the
   producer/consumer/stats tasks it started and **flushes/resets their queues** — nothing
   is left suspended or holding stale data across a transition.
-- Tasks are **created fresh on entering `STREAM_WIFI`/`STREAM_SDCARD`** and **deleted on
-  exit**, rather than pre-created and suspended. Transitions are operator-driven and rare,
-  so the task-create/delete churn is an acceptable trade for zero idle CPU/RAM cost.
+- Tasks are **created fresh on entering `STREAM_WIFI`/`STREAM_SDCARD`/`STREAM_TCP`** and
+  **deleted on exit**, rather than pre-created and suspended. Transitions are
+  operator-driven and rare, so the task-create/delete churn is an acceptable trade for
+  zero idle CPU/RAM cost.
 
 ### Calibration states (provisioning only)
 
@@ -100,15 +102,18 @@ records, whether it needs its own task) is deferred until that work starts.
 ## Task & queue architecture
 
 Three independent producer→queue→consumer pipelines (IMU, camera, stats), all created and
-destroyed together by the state machine when entering/leaving `STREAM_WIFI`/`STREAM_SDCARD`.
-Only one of the two sink-specific consumer tasks per pipeline runs at a time — the other
-sink's consumer simply isn't created — so, unlike the old dual-ring IMU hack, there's no
-need to worry about two sinks draining the same queue concurrently.
+destroyed together by the state machine when entering/leaving `STREAM_WIFI`/`STREAM_SDCARD`/
+`STREAM_TCP`. Only one of the sink-specific consumer tasks per pipeline runs at a time — the
+other sinks' consumers simply aren't created — so, unlike the old dual-ring IMU hack,
+there's no need to worry about two sinks draining the same queue concurrently.
 
-Each pipeline's consumer is **sink-specific** (a `..._wifi_consumer_task` and a
-`..._sdcard_consumer_task`, not one task branching on state), because these are expected to
-diverge and be reused independently later — except the stats pipeline, which uses one
-branching consumer (see table).
+Each pipeline's consumer is **sink-specific** (a `..._wifi_consumer_task`, a
+`..._sdcard_consumer_task`, and (in `tcp_client.c`) a `..._tcp_consumer_task`, not one task
+branching on state), because these are expected to diverge and be reused independently
+later — except the stats pipeline, which uses one branching consumer (see table). The wifi
+and tcp consumers send byte-identical camera/IMU wire payloads (see `tcp_client.h`); tcp
+just wraps them in a `{type, len}` header on one shared socket instead of an HTTP POST per
+message.
 
 ### Task table
 
@@ -116,9 +121,9 @@ branching consumer (see table).
 |---|---|---|---|---|
 | `main_state_machine_task` | 0 | 10 | poll every 500 ms | `CONFIG_STATE_MACHINE_TASK_PRIORITY`, `CONFIG_STATE_MACHINE_POLL_MS` |
 | `imu_capture_task` | 1 | 22 | `esp_timer` @ 1 ms → task-notify | `CONFIG_IMU_CAPTURE_PRIORITY`, `CONFIG_IMU_CAPTURE_CORE`, `CONFIG_IMU_CAPTURE_PERIOD_MS` |
-| `imu_wifi_consumer_task` / `imu_sdcard_consumer_task` | 0 | 6 | every 100 ms, drain ≤100 items | `CONFIG_IMU_CONSUMER_PRIORITY`, `CONFIG_IMU_CONSUMER_CORE`, `CONFIG_IMU_CONSUMER_PERIOD_MS`, `CONFIG_IMU_CONSUMER_BATCH` |
+| `imu_wifi_consumer_task` / `imu_sdcard_consumer_task` / `imu_tcp_consumer_task` | 0 | 6 | every 100 ms, drain ≤100 items | `CONFIG_IMU_CONSUMER_PRIORITY`, `CONFIG_IMU_CONSUMER_CORE`, `CONFIG_IMU_CONSUMER_PERIOD_MS`, `CONFIG_IMU_CONSUMER_BATCH` |
 | `camera_capture_task` | 1 | 20 | `esp_timer` @ configurable period → task-notify | `CONFIG_CAMERA_CAPTURE_PRIORITY`, `CONFIG_CAMERA_CAPTURE_CORE`, `CONFIG_CAMERA_CAPTURE_FPS` |
-| `camera_wifi_consumer_task` / `camera_sdcard_consumer_task` | 0 | 6 | every 100 ms, drain available frames | `CONFIG_CAMERA_CONSUMER_PRIORITY`, `CONFIG_CAMERA_CONSUMER_CORE`, `CONFIG_CAMERA_CONSUMER_PERIOD_MS` |
+| `camera_wifi_consumer_task` / `camera_sdcard_consumer_task` / `camera_tcp_consumer_task` | 0 | 6 | every 100 ms, drain available frames | `CONFIG_CAMERA_CONSUMER_PRIORITY`, `CONFIG_CAMERA_CONSUMER_CORE`, `CONFIG_CAMERA_CONSUMER_PERIOD_MS` |
 | `stats_producer_task` | 1 | 12 | every 500 ms | `CONFIG_STATS_PRODUCER_PRIORITY`, `CONFIG_STATS_PRODUCER_CORE`, `CONFIG_STATS_PRODUCER_PERIOD_MS` |
 | `stats_writer_task` (branches on active sink) | 0 | 7 | every 500 ms | `CONFIG_STATS_CONSUMER_PRIORITY`, `CONFIG_STATS_CONSUMER_CORE`, `CONFIG_STATS_CONSUMER_PERIOD_MS` |
 
