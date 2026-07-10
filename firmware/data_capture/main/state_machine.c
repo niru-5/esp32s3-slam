@@ -14,6 +14,7 @@
 #include "camera.h"
 #include "sysstats.h"
 #include "net_client.h"
+#include "tcp_client.h"
 #include "sdcard.h"
 
 static const char *TAG = "STATE";
@@ -51,6 +52,12 @@ static void teardown_active_pipelines(void) {
         break;
     case APP_STATE_STREAM_SDCARD:
         sdcard_pipeline_stop();
+        sysstats_pipeline_stop();
+        camera_pipeline_stop();
+        imu_pipeline_stop();
+        break;
+    case APP_STATE_STREAM_TCP:
+        tcp_client_pipeline_stop();
         sysstats_pipeline_stop();
         camera_pipeline_stop();
         imu_pipeline_stop();
@@ -102,6 +109,25 @@ static void enter_stream_sdcard(void) {
     ESP_LOGI(TAG, "-> STREAM_SDCARD");
 }
 
+static void enter_stream_tcp(void) {
+    teardown_active_pipelines();
+    s_state = APP_STATE_IDLE;
+
+    if (imu_pipeline_start() != ESP_OK ||
+        camera_pipeline_start() != ESP_OK ||
+        tcp_client_pipeline_start() != ESP_OK ||
+        sysstats_pipeline_start(SYSSTATS_SINK_TCP) != ESP_OK) {
+        ESP_LOGE(TAG, "failed to start tcp streaming pipeline — rolling back");
+        tcp_client_pipeline_stop();
+        sysstats_pipeline_stop();
+        camera_pipeline_stop();
+        imu_pipeline_stop();
+        return;
+    }
+    s_state = APP_STATE_STREAM_TCP;
+    ESP_LOGI(TAG, "-> STREAM_TCP");
+}
+
 static void enter_idle(void) {
     teardown_active_pipelines();
     s_state = APP_STATE_IDLE;
@@ -125,6 +151,7 @@ static void handle_command(char c) {
     case '3': enter_idle();                                      break;
     case '4': enter_calibration(APP_STATE_IMU_CALIBRATION);       break;
     case '5': enter_calibration(APP_STATE_CAMERA_CALIBRATION);    break;
+    case '6': enter_stream_tcp();                                 break;
     default: break;  // ignore newlines / anything else
     }
 }
@@ -150,7 +177,7 @@ static void main_state_machine_task(void *arg) {
     int flags = fcntl(fileno(stdin), F_GETFL, 0);
     fcntl(fileno(stdin), F_SETFL, flags | O_NONBLOCK);
 
-    ESP_LOGI(TAG, "ready — send 1=wifi 2=sdcard 3=stop 4=imu_cal 5=cam_cal");
+    ESP_LOGI(TAG, "ready — send 1=wifi 2=sdcard 3=stop 4=imu_cal 5=cam_cal 6=tcp");
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(CONFIG_STATE_MACHINE_POLL_MS));
         int c;

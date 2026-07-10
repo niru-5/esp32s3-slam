@@ -92,6 +92,7 @@ static esp_err_t make_subdir(const char *name, char *out, size_t out_sz) {
 // the index is a monotonic per-session counter so files sort in capture order
 // regardless of filesystem listing order, and ts_ms (esp_timer microseconds
 // since boot / 1000) is kept alongside it for precise SLAM-side timing.
+#if CONFIG_ENABLE_CAMERA
 static void save_frame(int64_t ts_us, const uint8_t *buf, size_t len) {
     static uint32_t s_frame_index = 0;
     uint32_t idx = s_frame_index++;
@@ -114,6 +115,7 @@ static void save_frame(int64_t ts_us, const uint8_t *buf, size_t len) {
         ESP_LOGW(TAG, "short write on %s (%u/%u bytes)",
                  path, (unsigned)written, (unsigned)len);
 }
+#endif // CONFIG_ENABLE_CAMERA
 
 // Write one batch drained from imu_queue into <session_dir>/imu/ as
 // imu_<index>_<ts_ms>.bin: raw bytes in the same wire format used by
@@ -123,6 +125,7 @@ static void save_frame(int64_t ts_us, const uint8_t *buf, size_t len) {
 // avoids that entirely. software/host_server/wire.py's parse_imu_payload()
 // already decodes this exact layout -- see also tools/parse_imu_bin.py, a
 // standalone copy for reading these files straight off the card.
+#if CONFIG_ENABLE_IMU
 static void save_imu_bin(const uint8_t *wire, size_t wire_len) {
     static uint32_t s_batch_index = 0;
     uint32_t idx = s_batch_index++;
@@ -145,11 +148,13 @@ static void save_imu_bin(const uint8_t *wire, size_t wire_len) {
         ESP_LOGW(TAG, "short write on %s (%u/%u bytes)",
                  path, (unsigned)written, (unsigned)wire_len);
 }
+#endif // CONFIG_ENABLE_IMU
 
 // --------------------------------------------------------------------------
 // Consumer tasks
 // --------------------------------------------------------------------------
 
+#if CONFIG_ENABLE_IMU
 static void imu_sdcard_consumer_task(void *arg) {
     const size_t max_len = IMU_WIRE_HEADER_LEN + CONFIG_IMU_CONSUMER_BATCH * IMU_WIRE_SAMPLE_LEN;
     imu_sample_t *samples = malloc(CONFIG_IMU_CONSUMER_BATCH * sizeof(imu_sample_t));
@@ -176,7 +181,9 @@ static void imu_sdcard_consumer_task(void *arg) {
         save_imu_bin(wire, wire_len);
     }
 }
+#endif // CONFIG_ENABLE_IMU
 
+#if CONFIG_ENABLE_CAMERA
 static void camera_sdcard_consumer_task(void *arg) {
     camera_frame_t *frames = malloc(CONFIG_CAMERA_QUEUE_LEN * sizeof(camera_frame_t));
     if (!frames) {
@@ -198,6 +205,7 @@ static void camera_sdcard_consumer_task(void *arg) {
         }
     }
 }
+#endif // CONFIG_ENABLE_CAMERA
 
 // --------------------------------------------------------------------------
 // Public API
@@ -259,11 +267,16 @@ esp_err_t sdcard_init(void) {
 }
 
 esp_err_t sdcard_pipeline_start(void) {
+#if CONFIG_ENABLE_IMU
     if (xTaskCreatePinnedToCore(imu_sdcard_consumer_task, "imu_sd", 8192, NULL,
                                 CONFIG_IMU_CONSUMER_PRIORITY, &s_imu_consumer_handle,
                                 CONFIG_IMU_CONSUMER_CORE) != pdPASS)
         return ESP_ERR_NO_MEM;
+#else
+    ESP_LOGW(TAG, "IMU sdcard logging disabled (CONFIG_ENABLE_IMU=0)");
+#endif
 
+#if CONFIG_ENABLE_CAMERA
     if (xTaskCreatePinnedToCore(camera_sdcard_consumer_task, "cam_sd", 8192, NULL,
                                 CONFIG_CAMERA_CONSUMER_PRIORITY, &s_camera_consumer_handle,
                                 CONFIG_CAMERA_CONSUMER_CORE) != pdPASS) {
@@ -271,6 +284,9 @@ esp_err_t sdcard_pipeline_start(void) {
         s_imu_consumer_handle = NULL;
         return ESP_ERR_NO_MEM;
     }
+#else
+    ESP_LOGW(TAG, "camera sdcard logging disabled (CONFIG_ENABLE_CAMERA=0)");
+#endif
 
     ESP_LOGI(TAG, "sdcard consumers started");
     return ESP_OK;

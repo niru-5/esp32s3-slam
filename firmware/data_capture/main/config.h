@@ -19,6 +19,12 @@
 #define CONFIG_REMOTE_HOST "192.168.178.22"
 #define CONFIG_REMOTE_PORT 8080
 
+// Port the tcp_client.c consumers connect to during STREAM_TCP (raw framed
+// binary stream -- see tcp_client.h). Distinct from CONFIG_REMOTE_PORT since
+// host_server listens for both on the same host but different sockets
+// (HTTP viewer/ingest vs. raw TCP ingest).
+#define CONFIG_REMOTE_TCP_PORT 8081
+
 // --------------------------------------------------------------------------
 // main_state_machine_task — owns the IDLE/STREAM_WIFI/STREAM_SDCARD/
 // CALIBRATION state and creates/deletes the pipelines below on transition.
@@ -28,6 +34,17 @@
 #define CONFIG_STATE_MACHINE_TASK_PRIORITY 10
 #define CONFIG_STATE_MACHINE_TASK_CORE     0
 #define CONFIG_STATE_MACHINE_POLL_MS       500
+
+// --------------------------------------------------------------------------
+// Feature toggles — disable IMU or camera capture/streaming entirely to
+// isolate the other's performance (e.g. does turning off IMU logging speed
+// up camera frame writes on SD?). CONFIG_ENABLE_IMU=0 stops imu_capture_task
+// itself (imu.c) as well as both consumer paths (net_client.c, sdcard.c).
+// CONFIG_ENABLE_CAMERA=0 only gates the consumer paths -- camera_capture_task
+// (camera.c) keeps running at its already-low FPS regardless.
+// --------------------------------------------------------------------------
+#define CONFIG_ENABLE_IMU     0
+#define CONFIG_ENABLE_CAMERA  1
 
 // --------------------------------------------------------------------------
 // IMU pipeline: imu_capture_task (esp_timer @ IMU_CAPTURE_PERIOD_MS wakes the
@@ -55,7 +72,7 @@
 #define CONFIG_CAMERA_CAPTURE_CORE     1
 
 // Valid range 1-20 fps (i.e. capture period clamped 1000ms-50ms).
-#define CONFIG_CAMERA_CAPTURE_FPS      2
+#define CONFIG_CAMERA_CAPTURE_FPS      5
 #if CONFIG_CAMERA_CAPTURE_FPS < 1 || CONFIG_CAMERA_CAPTURE_FPS > 20
 #error "CONFIG_CAMERA_CAPTURE_FPS must be between 1 and 20"
 #endif

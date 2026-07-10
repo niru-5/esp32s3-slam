@@ -49,6 +49,7 @@ typedef struct {
 typedef enum {
     SYSSTATS_SINK_WIFI,
     SYSSTATS_SINK_SDCARD,
+    SYSSTATS_SINK_TCP,
 } sysstats_sink_t;
 
 // Initialise the chip temperature sensor and prime the CPU-load baseline.

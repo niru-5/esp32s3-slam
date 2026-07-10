@@ -7,17 +7,21 @@
 // Owns the rig's runtime operating mode, driven by single-digit commands
 // polled from the console (see docs/architecture.md "Runtime state machine"):
 //
-//   1 -> STREAM_WIFI        start camera+IMU capture, stream to the host
+//   1 -> STREAM_WIFI        start camera+IMU capture, stream to the host over HTTP
 //   2 -> STREAM_SDCARD       start camera+IMU capture, log to the SD card
-//   3 -> IDLE                stop streaming (either sink)
+//   3 -> IDLE                stop streaming (any sink)
 //   4 -> IMU_CALIBRATION     provisioning stub, see state_machine.c
 //   5 -> CAMERA_CALIBRATION  provisioning stub, see state_machine.c
+//   6 -> STREAM_TCP          start camera+IMU capture, stream to the host over
+//                            a raw TCP socket (see tcp_client.h) instead of
+//                            HTTP -- lower per-message overhead, same capture
+//                            pipelines as STREAM_WIFI.
 //
-// 1<->2 switch directly (no need to send 3 first); 4/5 force an implicit
-// teardown of whatever streaming pipeline is active first. Every transition
-// creates the pipelines it needs fresh and deletes whatever was running
-// before it -- see imu.h/camera.h/sysstats.h for the pipelines themselves and
-// net_client.h/sdcard.h for the two sinks.
+// 1/2/6 switch directly between each other (no need to send 3 first); 4/5
+// force an implicit teardown of whatever streaming pipeline is active first.
+// Every transition creates the pipelines it needs fresh and deletes whatever
+// was running before it -- see imu.h/camera.h/sysstats.h for the pipelines
+// themselves and net_client.h/tcp_client.h/sdcard.h for the three sinks.
 //
 // main_state_machine_task is deliberately light: it polls stdin
 // non-blockingly every CONFIG_STATE_MACHINE_POLL_MS. This is a
@@ -30,6 +34,7 @@ typedef enum {
     APP_STATE_STREAM_SDCARD,
     APP_STATE_IMU_CALIBRATION,
     APP_STATE_CAMERA_CALIBRATION,
+    APP_STATE_STREAM_TCP,
 } app_state_t;
 
 // Create main_state_machine_task (prio CONFIG_STATE_MACHINE_TASK_PRIORITY,
