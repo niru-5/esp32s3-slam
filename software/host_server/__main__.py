@@ -29,9 +29,15 @@ def main(argv: list[str] | None = None) -> int:
                     help="bind address (default: all interfaces)")
     ap.add_argument("--port", type=int, default=8080,
                     help="listen port (must match CONFIG_REMOTE_PORT; default 8080)")
-    ap.add_argument("--tcp-port", type=int, default=8081,
-                    help="raw-TCP STREAM_TCP ingest port (must match "
-                         "CONFIG_REMOTE_TCP_PORT; default 8081)")
+    ap.add_argument("--tcp-frame-port", type=int, default=8081,
+                    help="raw-TCP STREAM_TCP frame ingest port (must match "
+                         "CONFIG_REMOTE_TCP_FRAME_PORT; default 8081)")
+    ap.add_argument("--tcp-imu-port", type=int, default=8082,
+                    help="raw-TCP STREAM_TCP IMU ingest port (must match "
+                         "CONFIG_REMOTE_TCP_IMU_PORT; default 8082)")
+    ap.add_argument("--tcp-stats-port", type=int, default=8083,
+                    help="raw-TCP STREAM_TCP stats ingest port (must match "
+                         "CONFIG_REMOTE_TCP_STATS_PORT; default 8083)")
     ap.add_argument("--bag", default=None,
                     help="rosbag2 output directory (default: bags/slam_<timestamp>)")
     ap.add_argument("--storage", default="sqlite3", choices=["sqlite3", "mcap"],
@@ -75,7 +81,8 @@ def main(argv: list[str] | None = None) -> int:
     http_worker = threading.Thread(target=server.serve_forever, daemon=True)
     http_worker.start()
     tcp_worker = threading.Thread(target=serve_tcp_ingest,
-                                  args=(args.host, args.tcp_port, hub, recorder, stop),
+                                  args=(args.host, args.tcp_frame_port, args.tcp_imu_port,
+                                        args.tcp_stats_port, hub, recorder, stop),
                                   daemon=True)
     tcp_worker.start()
     try:

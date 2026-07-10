@@ -5,14 +5,21 @@
 #include "esp_err.h"
 
 // --------------------------------------------------------------------------
-// TCP sink — raw framed binary stream to
-// CONFIG_REMOTE_HOST:CONFIG_REMOTE_TCP_PORT, as a lower-overhead alternative
-// to net_client.c's HTTP POST sink (no per-message HTTP request/response,
-// just one persistent socket). One connection carries all three streams
-// (frame/imu/stats), multiplexed by a small header per message:
+// TCP sink — three independent persistent connections to
+// CONFIG_REMOTE_HOST:{CONFIG_REMOTE_TCP_FRAME_PORT,_IMU_PORT,_STATS_PORT},
+// one per stream, as a lower-overhead alternative to net_client.c's HTTP POST
+// sink (no per-message HTTP request/response). Each connection has exactly
+// one writer task (camera_tcp_consumer_task / imu_tcp_consumer_task / the
+// sysstats.c stats_writer_task via tcp_client_send_stats), so — unlike an
+// earlier single-shared-socket design — no mutex is needed, and a slow/large
+// frame send can never head-of-line-block a small time-critical IMU/stats
+// send behind it on the same socket.
 //
-//   uint8_t  type;   TCP_MSG_FRAME=1 / TCP_MSG_IMU=2 / TCP_MSG_STATS=3
-//   uint32_t len;    payload length that follows (little-endian)
+// Wire framing per connection (little-endian, no padding): since each
+// connection only ever carries one message type, there's no per-message type
+// tag -- just a length prefix:
+//
+//   uint32_t len;    payload length that follows
 //   uint8_t  payload[len];
 //
 // Payloads:
@@ -20,26 +27,18 @@
 //   IMU    -- imu_serialize_wire() output, unchanged (see imu.h)
 //   STATS  -- sysstats_serialize_snapshot() output, unchanged (see sysstats.h)
 //
-// camera_tcp_consumer_task and imu_tcp_consumer_task (this file) plus
-// stats_writer_task (sysstats.c, via tcp_client_send_stats) all share one
-// socket, so every send is wrapped in a mutex to keep a message's header+
-// payload atomic on the wire. Matches software/host_server/tcp_ingest.py --
-// keep the two in sync.
+// Matches software/host_server/tcp_ingest.py -- keep the two in sync.
 // --------------------------------------------------------------------------
-
-#define TCP_MSG_FRAME 1
-#define TCP_MSG_IMU   2
-#define TCP_MSG_STATS 3
 
 // Create imu_tcp_consumer_task + camera_tcp_consumer_task (priorities/cores/
 // periods reused from config.h's IMU/CAMERA consumer settings — only one of
-// the wifi/tcp/sdcard sinks runs at a time). The socket itself connects
-// lazily on first send, not here. Returns ESP_OK once both tasks are running.
+// the wifi/tcp/sdcard sinks runs at a time). Sockets connect lazily on first
+// send, not here. Returns ESP_OK once both tasks are running.
 esp_err_t tcp_client_pipeline_start(void);
 
-// Delete the tcp consumer tasks and close the socket + mutex.
+// Delete the tcp consumer tasks and close all three connections.
 void tcp_client_pipeline_stop(void);
 
-// Push one system-stats snapshot payload (SYSSTATS_WIRE_LEN bytes). Called by
-// stats_writer_task when the tcp sink is active.
+// Push one system-stats snapshot payload (SYSSTATS_WIRE_LEN bytes) on the
+// stats connection. Called by stats_writer_task when the tcp sink is active.
 esp_err_t tcp_client_send_stats(const uint8_t *payload, size_t len);

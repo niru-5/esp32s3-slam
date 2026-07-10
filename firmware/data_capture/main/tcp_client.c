@@ -8,7 +8,6 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/semphr.h"
 
 #include "config.h"
 #include "camera.h"
@@ -17,30 +16,39 @@
 
 static const char *TAG = "TCPNET";
 
-static int               s_sock        = -1;
-static SemaphoreHandle_t s_send_mutex  = NULL;
+// One socket per stream, each written to by exactly one task -- no mutex
+// needed (see tcp_client.h for why this replaced a single shared socket).
+typedef struct {
+    int         sock;
+    uint16_t    port;
+    const char *label;   // for logging only
+} tcp_conn_t;
+
+static tcp_conn_t s_frame_conn = { .sock = -1, .port = CONFIG_REMOTE_TCP_FRAME_PORT, .label = "frame" };
+static tcp_conn_t s_imu_conn   = { .sock = -1, .port = CONFIG_REMOTE_TCP_IMU_PORT,   .label = "imu"   };
+static tcp_conn_t s_stats_conn = { .sock = -1, .port = CONFIG_REMOTE_TCP_STATS_PORT, .label = "stats" };
 
 static TaskHandle_t s_imu_consumer_handle    = NULL;
 static TaskHandle_t s_camera_consumer_handle = NULL;
 
 // --------------------------------------------------------------------------
-// Socket plumbing. Must be called with s_send_mutex held.
+// Socket plumbing
 // --------------------------------------------------------------------------
 
-static esp_err_t tcp_connect_locked(void) {
-    if (s_sock >= 0) return ESP_OK;
+static esp_err_t tcp_connect(tcp_conn_t *conn) {
+    if (conn->sock >= 0) return ESP_OK;
 
     int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock < 0) {
-        ESP_LOGW(TAG, "socket() failed: errno %d", errno);
+        ESP_LOGW(TAG, "[%s] socket() failed: errno %d", conn->label, errno);
         return ESP_FAIL;
     }
 
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
-    addr.sin_port   = htons(CONFIG_REMOTE_TCP_PORT);
+    addr.sin_port   = htons(conn->port);
     if (inet_pton(AF_INET, CONFIG_REMOTE_HOST, &addr.sin_addr) != 1) {
-        ESP_LOGE(TAG, "inet_pton failed for host '%s'", CONFIG_REMOTE_HOST);
+        ESP_LOGE(TAG, "[%s] inet_pton failed for host '%s'", conn->label, CONFIG_REMOTE_HOST);
         close(sock);
         return ESP_FAIL;
     }
@@ -49,8 +57,8 @@ static esp_err_t tcp_connect_locked(void) {
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &snd_timeout, sizeof(snd_timeout));
 
     if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        ESP_LOGW(TAG, "connect to %s:%d failed: errno %d",
-                 CONFIG_REMOTE_HOST, CONFIG_REMOTE_TCP_PORT, errno);
+        ESP_LOGW(TAG, "[%s] connect to %s:%d failed: errno %d",
+                 conn->label, CONFIG_REMOTE_HOST, conn->port, errno);
         close(sock);
         return ESP_FAIL;
     }
@@ -58,61 +66,54 @@ static esp_err_t tcp_connect_locked(void) {
     int one = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
-    s_sock = sock;
-    ESP_LOGI(TAG, "connected to %s:%d", CONFIG_REMOTE_HOST, CONFIG_REMOTE_TCP_PORT);
+    conn->sock = sock;
+    ESP_LOGI(TAG, "[%s] connected to %s:%d", conn->label, CONFIG_REMOTE_HOST, conn->port);
     return ESP_OK;
 }
 
-static void tcp_close_locked(void) {
-    if (s_sock >= 0) {
-        close(s_sock);
-        s_sock = -1;
+static void tcp_close(tcp_conn_t *conn) {
+    if (conn->sock >= 0) {
+        close(conn->sock);
+        conn->sock = -1;
     }
 }
 
-static esp_err_t send_all_locked(const uint8_t *buf, size_t len) {
+static esp_err_t send_all(int sock, const uint8_t *buf, size_t len) {
     size_t sent = 0;
     while (sent < len) {
-        int n = send(s_sock, buf + sent, len - sent, 0);
-        if (n <= 0) {
-            ESP_LOGW(TAG, "send() failed: errno %d", errno);
-            return ESP_FAIL;
-        }
+        int n = send(sock, buf + sent, len - sent, 0);
+        if (n <= 0) return ESP_FAIL;
         sent += (size_t)n;
     }
     return ESP_OK;
 }
 
-// Send one framed message: header (type + len) then up to two payload
-// chunks back-to-back (e.g. a timestamp followed by the JPEG bytes it
-// belongs to) — avoids an extra copy just to concatenate them first. Held
-// under s_send_mutex for the whole call so concurrent producers (camera/imu/
-// stats) can't interleave a message's bytes on the shared socket.
-static esp_err_t send_msg(uint8_t type,
+// Send one length-prefixed message on `conn`: a 4-byte little-endian length
+// then up to two payload chunks back-to-back (e.g. a timestamp followed by
+// the JPEG bytes it belongs to) -- avoids an extra copy just to concatenate
+// them first. `conn` has exactly one caller task, so no locking needed.
+static esp_err_t send_msg(tcp_conn_t *conn,
                           const uint8_t *chunk1, size_t len1,
                           const uint8_t *chunk2, size_t len2) {
-    if (!s_send_mutex) return ESP_FAIL;
-    xSemaphoreTake(s_send_mutex, portMAX_DELAY);
-
-    esp_err_t err = tcp_connect_locked();
+    esp_err_t err = tcp_connect(conn);
     if (err == ESP_OK) {
-        uint8_t hdr[5];
+        uint8_t hdr[4];
         uint32_t total_len = (uint32_t)(len1 + len2);
-        hdr[0] = type;
-        memcpy(&hdr[1], &total_len, 4);
-        err = send_all_locked(hdr, sizeof(hdr));
-        if (err == ESP_OK && len1) err = send_all_locked(chunk1, len1);
-        if (err == ESP_OK && len2) err = send_all_locked(chunk2, len2);
+        memcpy(hdr, &total_len, 4);
+        err = send_all(conn->sock, hdr, sizeof(hdr));
+        if (err == ESP_OK && len1) err = send_all(conn->sock, chunk1, len1);
+        if (err == ESP_OK && len2) err = send_all(conn->sock, chunk2, len2);
     }
-    if (err != ESP_OK) tcp_close_locked();  // reconnect fresh next call
-
-    xSemaphoreGive(s_send_mutex);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "[%s] send failed, reconnecting next call", conn->label);
+        tcp_close(conn);  // reconnect fresh next call
+    }
     return err;
 }
 
 // --------------------------------------------------------------------------
 // imu_tcp_consumer_task — same drain/serialize as net_client.c's
-// imu_wifi_consumer_task, sent as a TCP_MSG_IMU frame instead of POSTed.
+// imu_wifi_consumer_task, sent on its own connection instead of POSTed.
 // --------------------------------------------------------------------------
 
 #if CONFIG_ENABLE_IMU
@@ -141,7 +142,7 @@ static void imu_tcp_consumer_task(void *arg) {
         size_t wire_len = imu_serialize_wire(samples, n, ref_esp_us, ref_ticks, wire);
 
         DEBUG_TIME_START(t_send);
-        send_msg(TCP_MSG_IMU, wire, wire_len, NULL, 0);
+        send_msg(&s_imu_conn, wire, wire_len, NULL, 0);
         DEBUG_TIME_END(t_send, TAG, "imu sending");
     }
 }
@@ -168,7 +169,7 @@ static void camera_tcp_consumer_task(void *arg) {
         uint32_t n = camera_queue_drain(frames, CONFIG_CAMERA_QUEUE_LEN);
         for (uint32_t i = 0; i < n; i++) {
             DEBUG_TIME_START(t_send);
-            send_msg(TCP_MSG_FRAME,
+            send_msg(&s_frame_conn,
                      (const uint8_t *)&frames[i].ts_us, sizeof(frames[i].ts_us),
                      frames[i].fb->buf, frames[i].fb->len);
             DEBUG_TIME_END(t_send, TAG, "camera sending");
@@ -183,17 +184,11 @@ static void camera_tcp_consumer_task(void *arg) {
 // --------------------------------------------------------------------------
 
 esp_err_t tcp_client_pipeline_start(void) {
-    s_send_mutex = xSemaphoreCreateMutex();
-    if (!s_send_mutex) return ESP_ERR_NO_MEM;
-
 #if CONFIG_ENABLE_IMU
     if (xTaskCreatePinnedToCore(imu_tcp_consumer_task, "imu_tcp", 8192, NULL,
                                 CONFIG_IMU_CONSUMER_PRIORITY, &s_imu_consumer_handle,
-                                CONFIG_IMU_CONSUMER_CORE) != pdPASS) {
-        vSemaphoreDelete(s_send_mutex);
-        s_send_mutex = NULL;
+                                CONFIG_IMU_CONSUMER_CORE) != pdPASS)
         return ESP_ERR_NO_MEM;
-    }
 #else
     ESP_LOGW(TAG, "IMU tcp streaming disabled (CONFIG_ENABLE_IMU=0)");
 #endif
@@ -203,16 +198,15 @@ esp_err_t tcp_client_pipeline_start(void) {
                                 CONFIG_CAMERA_CONSUMER_PRIORITY, &s_camera_consumer_handle,
                                 CONFIG_CAMERA_CONSUMER_CORE) != pdPASS) {
         if (s_imu_consumer_handle) { vTaskDelete(s_imu_consumer_handle); s_imu_consumer_handle = NULL; }
-        vSemaphoreDelete(s_send_mutex);
-        s_send_mutex = NULL;
         return ESP_ERR_NO_MEM;
     }
 #else
     ESP_LOGW(TAG, "camera tcp streaming disabled (CONFIG_ENABLE_CAMERA=0)");
 #endif
 
-    ESP_LOGI(TAG, "tcp consumers started -> tcp://%s:%u",
-             CONFIG_REMOTE_HOST, (unsigned)CONFIG_REMOTE_TCP_PORT);
+    ESP_LOGI(TAG, "tcp consumers started -> %s frame:%u imu:%u stats:%u",
+             CONFIG_REMOTE_HOST, (unsigned)CONFIG_REMOTE_TCP_FRAME_PORT,
+             (unsigned)CONFIG_REMOTE_TCP_IMU_PORT, (unsigned)CONFIG_REMOTE_TCP_STATS_PORT);
     return ESP_OK;
 }
 
@@ -220,15 +214,11 @@ void tcp_client_pipeline_stop(void) {
     if (s_imu_consumer_handle)    { vTaskDelete(s_imu_consumer_handle);    s_imu_consumer_handle    = NULL; }
     if (s_camera_consumer_handle) { vTaskDelete(s_camera_consumer_handle); s_camera_consumer_handle = NULL; }
 
-    if (s_send_mutex) {
-        xSemaphoreTake(s_send_mutex, portMAX_DELAY);
-        tcp_close_locked();
-        xSemaphoreGive(s_send_mutex);
-        vSemaphoreDelete(s_send_mutex);
-        s_send_mutex = NULL;
-    }
+    tcp_close(&s_frame_conn);
+    tcp_close(&s_imu_conn);
+    tcp_close(&s_stats_conn);
 }
 
 esp_err_t tcp_client_send_stats(const uint8_t *payload, size_t len) {
-    return send_msg(TCP_MSG_STATS, payload, len, NULL, 0);
+    return send_msg(&s_stats_conn, payload, len, NULL, 0);
 }

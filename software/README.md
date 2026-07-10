@@ -45,7 +45,9 @@ machine by setting, in `firmware/data_capture/main/config.h`:
 |------|---------|---------|
 | `--host` | `0.0.0.0` | Bind address. |
 | `--port` | `8080` | HTTP listen port (match `CONFIG_REMOTE_PORT`). |
-| `--tcp-port` | `8081` | Raw-TCP `STREAM_TCP` ingest port (match `CONFIG_REMOTE_TCP_PORT`). |
+| `--tcp-frame-port` | `8081` | Raw-TCP `STREAM_TCP` frame ingest port (match `CONFIG_REMOTE_TCP_FRAME_PORT`). |
+| `--tcp-imu-port` | `8082` | Raw-TCP `STREAM_TCP` IMU ingest port (match `CONFIG_REMOTE_TCP_IMU_PORT`). |
+| `--tcp-stats-port` | `8083` | Raw-TCP `STREAM_TCP` stats ingest port (match `CONFIG_REMOTE_TCP_STATS_PORT`). |
 | `--bag`  | `bags/slam_<timestamp>` | rosbag2 output directory. |
 | `--storage` | `sqlite3` | rosbag2 backend (`sqlite3` or `mcap`). |
 | `--no-record` | off | Live view only, no bag. |
@@ -53,14 +55,20 @@ machine by setting, in `firmware/data_capture/main/config.h`:
 ## STREAM_TCP (raw socket ingest)
 
 `STREAM_TCP` (serial command `6` on the firmware) is a lower-overhead
-alternative to `STREAM_WIFI`'s HTTP POSTs: one persistent TCP connection
-carries camera frames, IMU batches, and stats snapshots, each wrapped in a
-small `{type, len}` header instead of a full HTTP request per message. This
-server always listens for it on `--tcp-port` (`8081` by default) alongside the
-HTTP server — see [`host_server/tcp_ingest.py`](host_server/tcp_ingest.py) for
-the wire framing. Frames/samples arriving this way feed the same `Hub` and bag
-recorder as the HTTP path, so the live viewer and recorded bag look identical
-regardless of which mode the firmware is in.
+alternative to `STREAM_WIFI`'s HTTP POSTs: three independent persistent TCP
+connections, one per stream (camera frames, IMU batches, stats snapshots),
+each on its own port -- no HTTP request/response per message, and (since each
+connection only ever carries one message type) no type tag either, just a
+4-byte length prefix per message. One connection per stream also means a
+large/slow frame send can never head-of-line-block a small time-critical
+IMU/stats send behind it, and there's no cross-stream lock on the firmware
+side. This server always listens for all three (`--tcp-frame-port`/
+`--tcp-imu-port`/`--tcp-stats-port`, `8081`/`8082`/`8083` by default)
+alongside the HTTP server — see
+[`host_server/tcp_ingest.py`](host_server/tcp_ingest.py) for the wire framing.
+Frames/samples arriving this way feed the same `Hub` and bag recorder as the
+HTTP path, so the live viewer and recorded bag look identical regardless of
+which mode the firmware is in.
 
 ## HTTP endpoints
 

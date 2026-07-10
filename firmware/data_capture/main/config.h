@@ -19,11 +19,16 @@
 #define CONFIG_REMOTE_HOST "192.168.178.22"
 #define CONFIG_REMOTE_PORT 8080
 
-// Port the tcp_client.c consumers connect to during STREAM_TCP (raw framed
-// binary stream -- see tcp_client.h). Distinct from CONFIG_REMOTE_PORT since
-// host_server listens for both on the same host but different sockets
-// (HTTP viewer/ingest vs. raw TCP ingest).
-#define CONFIG_REMOTE_TCP_PORT 8081
+// Ports the tcp_client.c consumers connect to during STREAM_TCP (raw
+// length-prefixed binary stream -- see tcp_client.h). One dedicated
+// persistent connection per stream rather than sharing one socket: each
+// connection has exactly one writer task, so no cross-stream mutex is
+// needed, and a large/slow frame send can never head-of-line-block the
+// small time-critical IMU/stats sends behind it. Distinct from
+// CONFIG_REMOTE_PORT (STREAM_WIFI's HTTP port).
+#define CONFIG_REMOTE_TCP_FRAME_PORT 8081
+#define CONFIG_REMOTE_TCP_IMU_PORT   8082
+#define CONFIG_REMOTE_TCP_STATS_PORT 8083
 
 // --------------------------------------------------------------------------
 // main_state_machine_task — owns the IDLE/STREAM_WIFI/STREAM_SDCARD/

@@ -73,7 +73,7 @@ instead of) serial.
 | `3` | `IDLE` | stop streaming (any sink) — tear everything down |
 | `4` | `IMU_CALIBRATION` | run IMU calibration routine (provisioned only, see below) |
 | `5` | `CAMERA_CALIBRATION` | run camera calibration routine (provisioned only, see below) |
-| `6` | `STREAM_TCP` | start camera+IMU capture, stream to the host over a raw TCP socket (`tcp_client.c`) instead of HTTP |
+| `6` | `STREAM_TCP` | start camera+IMU capture, stream to the host over three dedicated raw TCP sockets (`tcp_client.c`, one per stream) instead of HTTP |
 
 ### Transition rules
 
@@ -112,8 +112,11 @@ Each pipeline's consumer is **sink-specific** (a `..._wifi_consumer_task`, a
 branching on state), because these are expected to diverge and be reused independently
 later — except the stats pipeline, which uses one branching consumer (see table). The wifi
 and tcp consumers send byte-identical camera/IMU wire payloads (see `tcp_client.h`); tcp
-just wraps them in a `{type, len}` header on one shared socket instead of an HTTP POST per
-message.
+just prefixes each with a 4-byte length instead of an HTTP POST per message, on its own
+dedicated connection per stream (`CONFIG_REMOTE_TCP_FRAME_PORT`/`_IMU_PORT`/`_STATS_PORT`) —
+since each connection has exactly one writer task, no cross-stream mutex is needed, and a
+large/slow frame send can never head-of-line-block a small IMU/stats send on the same
+socket the way an earlier single-shared-socket design could.
 
 ### Task table
 
