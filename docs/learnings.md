@@ -357,6 +357,95 @@ installed and switched to explicitly in application code.
 
 ---
 
+## 13. STREAM_TCP jitter — telling "receiver is slow" apart from "WiFi actually dropped a packet"
+
+**Symptom:** with `STREAM_TCP` (raw TCP sink, `tcp_client.c`), `camera sending took Xms`
+varied wildly — anywhere from ~10 ms to, in the worst observed case, **2881 ms** for a
+single frame — even after fixing an unrelated host-side stall (see below) and even at
+excellent WiFi signal (RSSI -19 to -25 dBm, about as strong as it gets) and low CPU on
+both ends (~3.4% on the ESP32, low on the host too).
+
+**First, a red herring that *was* real and worth fixing anyway:** `host_server`'s TCP
+ingest recv loop was calling `recorder.write_frame()`/`write_imu()`/`write_stats()`
+**synchronously**, in between `recv()` calls. `rosbag2`'s sqlite3 backend does a real
+disk write per message — fast most of the time, occasionally 100+ ms (fsync/disk
+contention). While that write ran, the loop wasn't back at `recv()`, the kernel's TCP
+buffers filled, and the ESP32's `send()` blocked via ordinary flow control. **Fix:**
+move recorder writes onto a dedicated background thread fed by a bounded queue
+(`software/host_server/tcp_ingest.py`), so a slow bag write only delays the bag, never
+the socket read. This is a good general rule on its own: **never do disk I/O (or any
+blocking work) directly in a socket's recv loop** — hand it off to a queue+worker.
+
+**Second, a real buffer-sizing problem:** `CONFIG_LWIP_TCP_SND_BUF_DEFAULT` defaulted to
+5760 bytes (4× MSS). A VGA JPEG frame is routinely 20-30 KB — far bigger than the local
+send buffer — so `send()` was *guaranteed* to block partway through every frame waiting
+for ACKs to free room, independent of how fast the receiver read. **Fix:** raised to
+17280 (12× MSS, kept as an exact MSS multiple). This helps, but doesn't explain
+multi-hundred-ms-to-multi-second stalls on its own.
+
+**The real remaining cause: intermittent real packet loss over WiFi**, confirmed with
+`tshark`/Wireshark captured on the host. How to read one of these captures for this kind
+of problem:
+
+- **`Win=` is per-packet-sender, not a global "send buffer size" figure** — it's
+  *that packet's sender's own receive window* ("how much more I'll currently accept from
+  you"), not the send buffer being debugged. Packets from the ESP32 show its own
+  `CONFIG_LWIP_TCP_WND_DEFAULT` (5760, irrelevant here since STREAM_TCP is
+  ESP32-sends-only); packets from the host show the host's receive window climbing to
+  65535 — large and healthy, which is what *rules out* "the receiver's socket buffer is
+  full" as the cause.
+- **`Seq=` is the cumulative byte offset since the connection started**, not a per-packet
+  size — don't confuse it with `Len=` (that packet's own payload size). A `Seq` in the
+  hundreds of thousands after a few seconds of streaming is completely normal.
+- **The actual tell for real loss:** the receiver repeating the same `Ack=` value
+  (`[TCP Dup ACK n#k]`) — "I'm still missing byte X" — followed by
+  `[TCP Retransmission]` or `[TCP Fast Retransmission]`. A capture with these is showing
+  you a genuinely dropped segment, not a display artifact.
+- **Fast retransmit vs. RTO — why some stalls were ~300-700 ms and others were seconds:**
+  TCP only fires the fast path after **3** duplicate ACKs. If the sender had nothing left
+  queued right after the loss (e.g. the loss lands near the tail of one frame's data, and
+  the next camera frame isn't ready for another ~500 ms at 2 fps), there's no follow-on
+  traffic to generate a 3rd duplicate ACK — so TCP has to fall back to a full
+  **retransmission timeout** instead, which is far slower.
+  `CONFIG_LWIP_TCP_RTO_TIME=1500` (this project's sdkconfig) is the base for that timeout,
+  and it lines up almost exactly with the two multi-second outliers seen here
+  (2881 ms / 1617 ms — consistent with one RTO firing late, possibly with backoff).
+- **Cross-referencing a firmware log spike against a capture:** the ESP32's
+  `esp_timer_get_time()`-based logs are in device-uptime µs/ms since boot, not
+  capture-relative time. Anchor the two clocks using a log line with a known wall-clock
+  correlate (here, the `"[frame] connected to ..."` line vs. the capture's first frame
+  for that same connection) and the offset lets you line up a specific `camera sending
+  took Xms` spike with a specific `[TCP Retransmission]` in the capture, byte-range and
+  all — this is how the two multi-second outliers above were confirmed to be exactly
+  these two loss events, not a WiFi disconnect or something else entirely.
+
+**Things ruled out along the way (worth checking in this order before assuming RF):**
+1. Host CPU load (checked via a system monitor — low) and ESP32 CPU load (sysstats
+   `cpu0_load`/`cpu1_load` — ~3.4%): rules out either side being compute-bound.
+2. Host on WiFi contending for the same channel: ruled out once confirmed the host is on
+   wired Ethernet.
+3. Chip temperature: got to ~70°C once when the board was placed physically right next
+   to the router (most likely picking up the router's *own* heat, or accumulated
+   self-heating from a long-running session — not a sign of an RF/software problem; not
+   dangerous for the ESP32-S3 either way, but ~50°C with some airflow is more comfortable
+   for long sessions).
+
+**Still open / considered but not yet applied:** lowering `CONFIG_LWIP_TCP_RTO_TIME`
+(e.g. to 500-800 ms) would shrink the *size* of the worst-case RTO-triggered stalls when
+they occur, but not their *frequency* — the underlying loss is still happening at the
+WiFi hop despite excellent RSSI, most likely from 2.4 GHz channel congestion/interference
+(the ESP32-S3 only does 2.4 GHz) rather than a link-margin problem. Next things worth
+trying: check for overlapping WiFi networks on the same channel, try a less congested
+channel (1/6/11), or test with likely interferers (Bluetooth devices) turned off nearby.
+
+**General rule:** when request/send latency is erratic and payload-uncorrelated,
+checking CPU/host-load first (cheap, rules out a whole category) and then looking for
+actual loss signatures in a packet capture (duplicate ACKs + retransmissions) beats
+guessing — RSSI alone only tells you about *your* device's link quality, not channel
+congestion, and a strong RSSI does not mean zero loss.
+
+---
+
 ## TL;DR checklist: data_capture streaming is slow / SD card won't mount
 1. Network POST taking 100s of ms and it's not obviously the WiFi signal (check RSSI via
    `/stats`)? → try `WIFI_PS_NONE` first, but don't stop there.
@@ -369,3 +458,6 @@ installed and switched to explicitly in application code.
    `CONFIG_FATFS_LFN_NONE` — descriptive (>8.3) filenames need `CONFIG_FATFS_LFN_HEAP`.
 5. Build suddenly overflows the app partition after adding a new driver (FATFS, SDMMC,
    etc.)? → switch to `CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE` if flash size allows.
+6. `STREAM_TCP` send times erratic/uncorrelated with payload size, even at good RSSI? →
+   check host/ESP32 CPU load first, then look for `[TCP Dup ACK]`/`[TCP Retransmission]`
+   in a `tshark` capture before suspecting the radio further — see §13.
