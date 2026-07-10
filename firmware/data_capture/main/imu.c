@@ -254,6 +254,11 @@ esp_err_t imu_init(void) {
 }
 
 esp_err_t imu_pipeline_start(void) {
+#if !CONFIG_ENABLE_IMU
+    ESP_LOGW(TAG, "IMU pipeline disabled (CONFIG_ENABLE_IMU=0) — skipping capture");
+    return ESP_OK;
+#endif
+
     s_overflow_count = 0;
     s_imu_queue = xQueueCreate(CONFIG_IMU_QUEUE_LEN, sizeof(imu_sample_t));
     if (!s_imu_queue) return ESP_ERR_NO_MEM;

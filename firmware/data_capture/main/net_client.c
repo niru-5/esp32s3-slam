@@ -89,6 +89,7 @@ static void close_conn(net_conn_t *conn) {
 // produce (see imu.h).
 // --------------------------------------------------------------------------
 
+#if CONFIG_ENABLE_IMU
 static void imu_wifi_consumer_task(void *arg) {
     const size_t max_len = IMU_WIRE_HEADER_LEN + CONFIG_IMU_CONSUMER_BATCH * IMU_WIRE_SAMPLE_LEN;
     imu_sample_t *samples = malloc(CONFIG_IMU_CONSUMER_BATCH * sizeof(imu_sample_t));
@@ -118,12 +119,14 @@ static void imu_wifi_consumer_task(void *arg) {
         DEBUG_TIME_END(t_send, TAG, "imu sending");
     }
 }
+#endif // CONFIG_ENABLE_IMU
 
 // --------------------------------------------------------------------------
 // camera_wifi_consumer_task — drains camera_queue every
 // CONFIG_CAMERA_CONSUMER_PERIOD_MS and POSTs each frame.
 // --------------------------------------------------------------------------
 
+#if CONFIG_ENABLE_CAMERA
 static void camera_wifi_consumer_task(void *arg) {
     camera_frame_t *frames = malloc(CONFIG_CAMERA_QUEUE_LEN * sizeof(camera_frame_t));
     if (!frames) {
@@ -146,17 +149,23 @@ static void camera_wifi_consumer_task(void *arg) {
         }
     }
 }
+#endif // CONFIG_ENABLE_CAMERA
 
 // --------------------------------------------------------------------------
 // Public API
 // --------------------------------------------------------------------------
 
 esp_err_t net_client_pipeline_start(void) {
+#if CONFIG_ENABLE_IMU
     if (xTaskCreatePinnedToCore(imu_wifi_consumer_task, "imu_wifi", 8192, NULL,
                                 CONFIG_IMU_CONSUMER_PRIORITY, &s_imu_consumer_handle,
                                 CONFIG_IMU_CONSUMER_CORE) != pdPASS)
         return ESP_ERR_NO_MEM;
+#else
+    ESP_LOGW(TAG, "IMU wifi streaming disabled (CONFIG_ENABLE_IMU=0)");
+#endif
 
+#if CONFIG_ENABLE_CAMERA
     if (xTaskCreatePinnedToCore(camera_wifi_consumer_task, "cam_wifi", 8192, NULL,
                                 CONFIG_CAMERA_CONSUMER_PRIORITY, &s_camera_consumer_handle,
                                 CONFIG_CAMERA_CONSUMER_CORE) != pdPASS) {
@@ -164,6 +173,9 @@ esp_err_t net_client_pipeline_start(void) {
         s_imu_consumer_handle = NULL;
         return ESP_ERR_NO_MEM;
     }
+#else
+    ESP_LOGW(TAG, "camera wifi streaming disabled (CONFIG_ENABLE_CAMERA=0)");
+#endif
 
     ESP_LOGI(TAG, "wifi consumers started -> http://%s:%u",
              CONFIG_REMOTE_HOST, (unsigned)CONFIG_REMOTE_PORT);
