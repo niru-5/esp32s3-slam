@@ -89,19 +89,30 @@ static esp_err_t send_all(int sock, const uint8_t *buf, size_t len) {
 }
 
 // Send one length-prefixed message on `conn`: a 4-byte little-endian length
-// then up to two payload chunks back-to-back (e.g. a timestamp followed by
-// the JPEG bytes it belongs to) -- avoids an extra copy just to concatenate
-// them first. `conn` has exactly one caller task, so no locking needed.
+// then up to two payload chunks (e.g. a timestamp followed by the JPEG bytes
+// it belongs to). When chunk1 is small (e.g. the frame path's 8-byte
+// timestamp) it's copied into the same stack buffer as the header and sent
+// in one call, instead of a separate few-byte send() -- that used to show up
+// on the wire as its own tiny TCP segment. chunk2 (the bulk payload, e.g. the
+// JPEG) is still sent on its own to avoid copying it. `conn` has exactly one
+// caller task, so no locking needed.
 static esp_err_t send_msg(tcp_conn_t *conn,
                           const uint8_t *chunk1, size_t len1,
                           const uint8_t *chunk2, size_t len2) {
     esp_err_t err = tcp_connect(conn);
     if (err == ESP_OK) {
-        uint8_t hdr[4];
         uint32_t total_len = (uint32_t)(len1 + len2);
-        memcpy(hdr, &total_len, 4);
-        err = send_all(conn->sock, hdr, sizeof(hdr));
-        if (err == ESP_OK && len1) err = send_all(conn->sock, chunk1, len1);
+        uint8_t hdr_buf[4 + 16];
+        if (len1 <= sizeof(hdr_buf) - 4) {
+            memcpy(hdr_buf, &total_len, 4);
+            if (len1) memcpy(hdr_buf + 4, chunk1, len1);
+            err = send_all(conn->sock, hdr_buf, 4 + len1);
+        } else {
+            uint8_t hdr[4];
+            memcpy(hdr, &total_len, 4);
+            err = send_all(conn->sock, hdr, sizeof(hdr));
+            if (err == ESP_OK) err = send_all(conn->sock, chunk1, len1);
+        }
         if (err == ESP_OK && len2) err = send_all(conn->sock, chunk2, len2);
     }
     if (err != ESP_OK) {
