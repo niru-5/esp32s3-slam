@@ -40,6 +40,13 @@
 #define CONFIG_STATE_MACHINE_TASK_CORE     0
 #define CONFIG_STATE_MACHINE_POLL_MS       500
 
+// Bumped from the original 4096 once IMU calibration (state_machine.c
+// imu_calibration_run()) started running synchronously on this task: its
+// locals (a static 1KB report buffer aside) plus imu_capture_stationary_
+// stats()/bmi2_perform_*_foc()'s own nested stack usage overflowed a 4096
+// stack on real hardware (tlsf.c heap-corruption assert, not a logic bug).
+#define CONFIG_STATE_MACHINE_TASK_STACK_SIZE 8192
+
 // --------------------------------------------------------------------------
 // Feature toggles — disable IMU or camera capture/streaming entirely to
 // isolate the other's performance (e.g. does turning off IMU logging speed
@@ -127,4 +134,24 @@
 //                                 on an unrelated mount failure.
 #define CONFIG_USE_SDCARD           1
 #define CONFIG_ENABLE_SDCARD_FORMAT 0
+
+// --------------------------------------------------------------------------
+// IMU hardware bias calibration (state_machine.c command 4, imu.c
+// imu_run_hw_foc_calibration). Runs BMI270 fast-offset-compensation (FOC) for
+// accel+gyro, persists the result to the chip's NVM, and reports a
+// before/after stationary sample so the operator can confirm it worked. See
+// docs/calibration.md.
+// --------------------------------------------------------------------------
+
+// How long to sample before and after FOC when computing mean/stddev per
+// axis (stddev is a stationarity check -- large values mean the rig moved
+// during the window).
+#define CONFIG_IMU_CALIBRATION_WINDOW_MS 3000
+
+// Local gravitational acceleration, m/s^2 -- only used to annotate the
+// calibration report in physical units; it does NOT feed into the BMI270 FOC
+// call itself (that targets a fixed factory-trimmed 1.000g on the selected
+// axis, not the true local g). Rough estimate for Belgium; adjust if the rig
+// is calibrated elsewhere.
+#define CONFIG_LOCAL_GRAVITY_MPS2 9.811
 

@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 
 from .wire import ImuSample, SysStats
 
+_EMA_ALPHA = 0.5  # weight on each new instantaneous-rate sample
+
 
 @dataclass
 class Hub:
@@ -23,9 +25,13 @@ class Hub:
     latest_frame_us: int = 0
     frame_version: int = 0          # bumped on every new frame
     frame_count: int = 0
+    frame_fps_ema: float = 0.0
+    _last_frame_esp_us: int | None = None
 
     latest_imu: ImuSample | None = None
     imu_count: int = 0
+    imu_hz_ema: float = 0.0
+    _last_imu_esp_us: int | None = None
 
     latest_stats: SysStats | None = None
     stats_count: int = 0
@@ -42,6 +48,17 @@ class Hub:
             self.latest_frame_us = esp_us
             self.frame_version += 1
             self.frame_count += 1
+            # Rate is measured on the device's own esp_timer clock (esp_us),
+            # not host arrival time: STREAM_TCP delivery is bursty under WiFi
+            # jitter/loss (see docs/learnings.md #13) -- a stall followed by a
+            # catch-up burst makes consecutive *arrivals* look near-instant,
+            # which would spike a host-clock-based rate well above reality.
+            if self._last_frame_esp_us is not None:
+                dt_us = esp_us - self._last_frame_esp_us
+                if dt_us > 0:
+                    inst_fps = 1e6 / dt_us
+                    self.frame_fps_ema += _EMA_ALPHA * (inst_fps - self.frame_fps_ema)
+            self._last_frame_esp_us = esp_us
             self._frame_cond.notify_all()
 
     def put_imu(self, samples: list[ImuSample]) -> None:
@@ -50,6 +67,17 @@ class Hub:
         with self._lock:
             self.latest_imu = samples[-1]
             self.imu_count += len(samples)
+            # One put_imu() call delivers a whole drained batch (commonly a few
+            # hundred samples). Rate = samples in this batch / device-clock time
+            # elapsed since the previous batch's last sample -- same
+            # arrival-jitter-immunity rationale as put_frame() above.
+            last_esp_us = samples[-1].esp_us
+            if self._last_imu_esp_us is not None:
+                dt_us = last_esp_us - self._last_imu_esp_us
+                if dt_us > 0:
+                    inst_hz = len(samples) * 1e6 / dt_us
+                    self.imu_hz_ema += _EMA_ALPHA * (inst_hz - self.imu_hz_ema)
+            self._last_imu_esp_us = last_esp_us
 
     def put_stats(self, stats: SysStats) -> None:
         with self._lock:
@@ -71,10 +99,10 @@ class Hub:
             uptime = max(time.time() - self.started_at, 1e-6)
             return {
                 "frame_count": self.frame_count,
-                "frame_fps": round(self.frame_count / uptime, 2),
+                "frame_fps": round(self.frame_fps_ema, 2),
                 "latest_frame_us": self.latest_frame_us,
                 "imu_count": self.imu_count,
-                "imu_hz": round(self.imu_count / uptime, 1),
+                "imu_hz": round(self.imu_hz_ema, 1),
                 "imu": None if imu is None else {
                     "esp_us": imu.esp_us,
                     "accel_g": {"x": imu.ax, "y": imu.ay, "z": imu.az},

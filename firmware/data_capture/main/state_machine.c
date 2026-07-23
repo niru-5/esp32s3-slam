@@ -23,13 +23,131 @@ static app_state_t s_state             = APP_STATE_IDLE;
 static bool        s_sdcard_available  = false;
 
 // --------------------------------------------------------------------------
-// Calibration stubs — provisioning only. The exact procedure (duration,
-// what's recorded, whether it needs its own task) is deferred until that
-// work starts; for now entering the state just logs and returns to IDLE.
+// IMU calibration — hardware bias/offset only (BMI270 FOC + NVM commit, see
+// imu.h imu_run_hw_foc_calibration). Runs synchronously on this task, same as
+// every other transition here. Accel FOC needs to know which axis gravity is
+// aligned with (bmi2_perform_accel_foc has no way to detect orientation
+// itself — see docs/calibration.md) so this walks the operator through it:
+// show a handful of live raw samples, explain the axis/sign encoding, then
+// block waiting for one digit. That block is a deliberate use of the console
+// as "a human-in-the-loop bring-up/test control channel, not a real-time
+// path" (see state_machine.h) — nothing else needs this task to keep
+// running promptly while it waits.
+//
+// Noise-density/random-walk/Allan-variance work is not implemented -- see
+// docs/calibration.md. Camera calibration is still a provisioning stub.
 // --------------------------------------------------------------------------
 
+// Block until the operator sends one non-blank byte, reusing the same
+// non-blocking stdin main_state_machine_task already configured. '\n'/'\r'
+// are skipped rather than treated as an answer -- the command that got us
+// here (e.g. "4\n" from a line-buffered terminal) can leave one buffered,
+// and without this it would be misread as the operator's answer before they
+// ever see the prompt.
+static int wait_for_console_digit(void) {
+    int c;
+    while (1) {
+        c = fgetc(stdin);
+        if (c == EOF) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
+        if (c == '\n' || c == '\r') continue;
+        return c;
+    }
+}
+
+// Show 10 raw samples over ~100ms and let the operator pick which axis is
+// reading ~1g. Returns false (calibration aborted, caller should bail
+// without touching the BMI270) if the operator sends anything but '1'-'6'.
+static bool select_gravity_axis(imu_accel_foc_axis_t *out) {
+    ESP_LOGI(TAG, "Hold the rig stationary. Sampling accel/gyro to help pick the gravity axis...");
+
+    imu_raw_preview_sample_t preview[10];
+    if (imu_preview_raw_samples(preview, 10, 10) != ESP_OK) {
+        ESP_LOGE(TAG, "preview capture failed -- aborting calibration");
+        return false;
+    }
+    float ax_sum = 0, ay_sum = 0, az_sum = 0;
+    for (int i = 0; i < 10; i++) {
+        ESP_LOGI(TAG, "  sample %2d: accel g = (% .4f, % .4f, % .4f)  gyro dps = (% .4f, % .4f, % .4f)",
+                 i, (double)preview[i].ax, (double)preview[i].ay, (double)preview[i].az,
+                 (double)preview[i].gx, (double)preview[i].gy, (double)preview[i].gz);
+        ax_sum += preview[i].ax; ay_sum += preview[i].ay; az_sum += preview[i].az;
+    }
+    ESP_LOGI(TAG, "  mean accel g = (% .4f, % .4f, % .4f) — whichever axis reads closest to +-1.0 "
+                  "is the one gravity is pulling along; the sign tells you which direction",
+             (double)(ax_sum / 10), (double)(ay_sum / 10), (double)(az_sum / 10));
+
+    ESP_LOGI(TAG, "Select that axis+sign: 1=+X 2=-X 3=+Y 4=-Y 5=+Z 6=-Z  (anything else aborts)");
+    ESP_LOGI(TAG, "Send one digit now:");
+
+    int c = wait_for_console_digit();
+    if (c < '1' || c > '6') {
+        ESP_LOGW(TAG, "calibration aborted (got 0x%02x, expected 1-6)", (unsigned)c);
+        return false;
+    }
+    *out = (imu_accel_foc_axis_t)(c - '0');
+    ESP_LOGI(TAG, "Using %s as the gravity axis for accel FOC", imu_accel_foc_axis_label(*out));
+    return true;
+}
+
 static void imu_calibration_run(void) {
-    ESP_LOGW(TAG, "IMU calibration not implemented yet");
+    ESP_LOGI(TAG, "=== IMU hardware FOC calibration ===");
+
+    imu_accel_foc_axis_t gravity_axis;
+    if (!select_gravity_axis(&gravity_axis)) return;
+
+    imu_stationary_stats_t before, after;
+    uint32_t foc_run_count = 0;
+
+    esp_err_t err = imu_run_hw_foc_calibration(CONFIG_IMU_CALIBRATION_WINDOW_MS, gravity_axis,
+                                                &before, &after, &foc_run_count);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "IMU calibration failed or NVM commit didn't stick (err=%s) — see log above",
+                 esp_err_to_name(err));
+        return;
+    }
+
+    // static, not a local: main_state_machine_task's stack is sized for a
+    // lightweight console poller (see CONFIG_STATE_MACHINE_TASK_STACK_SIZE) --
+    // a 1KB buffer sitting live on that stack for the whole synchronous
+    // calibration flow, on top of imu_capture_stationary_stats/bmi2_perform_
+    // *_foc's own nested locals, is most of what caused a stack-overflow ->
+    // heap-corruption crash (tlsf.c block_trim_free assert) the first time
+    // this ran on real hardware.
+    static char report[1024];
+    int n = snprintf(report, sizeof(report),
+        "IMU hardware FOC calibration report\n"
+        "foc_run_count=%lu  gravity_axis=%s  local_gravity_mps2=%.4f (CONFIG_LOCAL_GRAVITY_MPS2, "
+        "Belgium estimate — annotation only, not fed into the BMI270 FOC call)\n"
+        "\n"
+        "BEFORE (n=%lu samples):\n"
+        "  accel g   x=%.5f y=%.5f z=%.5f   std x=%.5f y=%.5f z=%.5f\n"
+        "  gyro  dps x=%.5f y=%.5f z=%.5f   std x=%.5f y=%.5f z=%.5f\n"
+        "\n"
+        "AFTER (n=%lu samples, hardware FOC + offset comp applied, committed to NVM):\n"
+        "  accel g   x=%.5f y=%.5f z=%.5f   std x=%.5f y=%.5f z=%.5f\n"
+        "  gyro  dps x=%.5f y=%.5f z=%.5f   std x=%.5f y=%.5f z=%.5f\n"
+        "\n"
+        "NOTE: bias/offset only. White-noise density, bias random walk, and\n"
+        "Allan-variance characterization are not yet implemented — see\n"
+        "docs/calibration.md.\n",
+        (unsigned long)foc_run_count, imu_accel_foc_axis_label(gravity_axis), (double)CONFIG_LOCAL_GRAVITY_MPS2,
+        (unsigned long)before.sample_count,
+        (double)before.ax_mean, (double)before.ay_mean, (double)before.az_mean,
+        (double)before.ax_std,  (double)before.ay_std,  (double)before.az_std,
+        (double)before.gx_mean, (double)before.gy_mean, (double)before.gz_mean,
+        (double)before.gx_std,  (double)before.gy_std,  (double)before.gz_std,
+        (unsigned long)after.sample_count,
+        (double)after.ax_mean, (double)after.ay_mean, (double)after.az_mean,
+        (double)after.ax_std,  (double)after.ay_std,  (double)after.az_std,
+        (double)after.gx_mean, (double)after.gy_mean, (double)after.gz_mean,
+        (double)after.gx_std,  (double)after.gy_std,  (double)after.gz_std);
+
+    ESP_LOGI(TAG, "\n%s", report);
+    if (s_sdcard_available) {
+        sdcard_write_imu_calibration_report(report, (size_t)n);
+    } else {
+        ESP_LOGW(TAG, "SD card unavailable — calibration report only in the serial log above");
+    }
 }
 
 static void camera_calibration_run(void) {
@@ -191,7 +309,8 @@ esp_err_t state_machine_start(bool sdcard_available) {
     if (!s_sdcard_available)
         ESP_LOGW(TAG, "SD card unavailable — command 2 (STREAM_SDCARD) will be rejected");
 
-    if (xTaskCreatePinnedToCore(main_state_machine_task, "state_machine", 4096, NULL,
+    if (xTaskCreatePinnedToCore(main_state_machine_task, "state_machine",
+                                CONFIG_STATE_MACHINE_TASK_STACK_SIZE, NULL,
                                 CONFIG_STATE_MACHINE_TASK_PRIORITY, NULL,
                                 CONFIG_STATE_MACHINE_TASK_CORE) != pdPASS)
         return ESP_ERR_NO_MEM;

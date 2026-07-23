@@ -47,3 +47,10 @@ void sdcard_pipeline_stop(void);
 // sysstats_snapshot_to_json()) as a line to the session's stats.jsonl.
 // Called by stats_writer_task when the sdcard sink is active.
 esp_err_t sdcard_write_stats(const uint8_t *json, size_t len);
+
+// Write one free-standing IMU calibration report (plain text) to
+// <SD_MOUNT_POINT>/imu_calibration_<timestamp>.txt -- at the SD root, not
+// inside a capture session directory, since calibration is a standalone
+// operator action (state_machine.c command 4), not a streaming session.
+// Only call if sdcard_init() succeeded.
+esp_err_t sdcard_write_imu_calibration_report(const char *text, size_t len);
