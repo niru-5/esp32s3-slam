@@ -29,6 +29,13 @@
 #define CONFIG_STATE_MACHINE_TASK_CORE     0
 #define CONFIG_STATE_MACHINE_POLL_MS       500
 
+// Bumped from the original 4096 once IMU calibration (state_machine.c
+// imu_calibration_run()) started running synchronously on this task: its
+// locals (a static 1KB report buffer aside) plus imu_capture_stationary_
+// stats()/bmi2_perform_*_foc()'s own nested stack usage overflowed a 4096
+// stack on real hardware (tlsf.c heap-corruption assert, not a logic bug).
+#define CONFIG_STATE_MACHINE_TASK_STACK_SIZE 8192
+
 // --------------------------------------------------------------------------
 // IMU pipeline: imu_capture_task (esp_timer @ IMU_CAPTURE_PERIOD_MS wakes the
 // task via task-notify — NOT a FreeRTOS software timer, see

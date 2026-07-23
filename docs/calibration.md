@@ -32,7 +32,16 @@ Triggered by console command `4` on `data_capture` (`APP_STATE_IMU_CALIBRATION`,
    this is meant to be a rare, deliberate operation, not something run every
    boot — a persistent NVS counter tracks how many times it's been invoked on
    this chip and logs a warning past the first.
-5. Capture another stationary window (same duration) — the "after" snapshot —
+5. `bmi2_nvm_prog()` ends with a `bmi2_soft_reset()` internally — the chip
+   comes back up in its power-on-default state (accel/gyro disabled) the same
+   way it would after a real power-cycle. `imu.c` re-runs the same
+   init/enable/ODR-range sequence used at boot
+   (`configure_bmi270_sensors()`) immediately afterward; skipping this would
+   leave every subsequent IMU read, including the normal streaming pipeline,
+   silently returning zeros for the rest of the session. (Found this the hard
+   way — first pass on real hardware, the "after" snapshot below came back
+   as exact zeros on every axis.)
+6. Capture another stationary window (same duration) — the "after" snapshot —
    so the before/after comparison shows whether the correction actually
    helped.
 

@@ -105,7 +105,14 @@ static void imu_calibration_run(void) {
         return;
     }
 
-    char report[1024];
+    // static, not a local: main_state_machine_task's stack is sized for a
+    // lightweight console poller (see CONFIG_STATE_MACHINE_TASK_STACK_SIZE) --
+    // a 1KB buffer sitting live on that stack for the whole synchronous
+    // calibration flow, on top of imu_capture_stationary_stats/bmi2_perform_
+    // *_foc's own nested locals, is most of what caused a stack-overflow ->
+    // heap-corruption crash (tlsf.c block_trim_free assert) the first time
+    // this ran on real hardware.
+    static char report[1024];
     int n = snprintf(report, sizeof(report),
         "IMU hardware FOC calibration report\n"
         "foc_run_count=%lu  gravity_axis=%s  local_gravity_mps2=%.4f (CONFIG_LOCAL_GRAVITY_MPS2, "
@@ -275,7 +282,8 @@ esp_err_t state_machine_start(bool sdcard_available) {
     if (!s_sdcard_available)
         ESP_LOGW(TAG, "SD card unavailable — command 2 (STREAM_SDCARD) will be rejected");
 
-    if (xTaskCreatePinnedToCore(main_state_machine_task, "state_machine", 4096, NULL,
+    if (xTaskCreatePinnedToCore(main_state_machine_task, "state_machine",
+                                CONFIG_STATE_MACHINE_TASK_STACK_SIZE, NULL,
                                 CONFIG_STATE_MACHINE_TASK_PRIORITY, NULL,
                                 CONFIG_STATE_MACHINE_TASK_CORE) != pdPASS)
         return ESP_ERR_NO_MEM;

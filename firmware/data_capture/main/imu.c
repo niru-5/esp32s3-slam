@@ -108,48 +108,13 @@ static void i2c_bus_scan(void) {
 // BMI270 init
 // --------------------------------------------------------------------------
 
-static esp_err_t bmi270_bringup(void) {
-    // Drive the BMI270 mode/address pins before any communication so the
-    // module needs no external pull resistors:
-    //   CSB high → I2C mode,  SA0 low → address 0x68
-    // A falling edge on CSB latches the BMI270 into SPI mode until the next
-    // power-on, so CSB must never glitch low. Preset the output latches BEFORE
-    // switching the pins to output (otherwise output mode drives 0 first), and
-    // enable a pull-up on CSB to bias it high through the boot window.
-    gpio_set_level(IMU_CSB_GPIO, 1);   // preset CSB latch high
-    gpio_set_level(IMU_ADDR_GPIO, 0);  // preset SA0 latch low
-    gpio_config_t imu_pins = {
-        .pin_bit_mask = (1ULL << IMU_CSB_GPIO) | (1ULL << IMU_ADDR_GPIO),
-        .mode         = GPIO_MODE_OUTPUT,
-        .pull_up_en   = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&imu_pins);
-    gpio_set_level(IMU_CSB_GPIO, 1);   // I2C mode
-    gpio_set_level(IMU_ADDR_GPIO, 0);  // address 0x68
-    vTaskDelay(pdMS_TO_TICKS(5)); // let BMI270 settle into I2C mode
-
-    i2c_config_t cfg = {
-        .mode             = I2C_MODE_MASTER,
-        .sda_io_num       = IMU_SDA_GPIO,
-        .scl_io_num       = IMU_SCL_GPIO,
-        .sda_pullup_en    = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en    = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = IMU_I2C_FREQ,
-    };
-    ESP_ERROR_CHECK(i2c_param_config(IMU_I2C_PORT, &cfg));
-    ESP_ERROR_CHECK(i2c_driver_install(IMU_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0));
-
-    i2c_bus_scan();
-
-    s_bmi2.read           = bmi2_i2c_read;
-    s_bmi2.write          = bmi2_i2c_write;
-    s_bmi2.delay_us       = bmi2_delay_us_cb;
-    s_bmi2.intf_ptr       = NULL;
-    s_bmi2.intf           = BMI2_I2C_INTF;
-    s_bmi2.read_write_len = 32;
-
+// bmi270_init + sensor_enable + ODR/range config, split out of
+// bmi270_bringup() so it can be re-run standalone after bmi2_nvm_prog() --
+// which ends with bmi2_soft_reset(), reverting the chip to power-on
+// defaults (sensors disabled) -- without repeating the GPIO/I2C-driver setup
+// that must only happen once. Recomputes s_raw_to_gs/s_raw_to_dps too, even
+// though the values are the same, since it's config[]-derived either way.
+static esp_err_t configure_bmi270_sensors(void) {
     int8_t err = bmi270_init(&s_bmi2);
     if (err != BMI2_OK) {
         ESP_LOGE(TAG, "bmi270_init failed: %d", err);
@@ -200,6 +165,51 @@ static esp_err_t bmi270_bringup(void) {
              (int)(2 << config[0].cfg.acc.range),
              (int)(125 * (1 << (BMI2_GYR_RANGE_125 - config[1].cfg.gyr.range))));
     return ESP_OK;
+}
+
+static esp_err_t bmi270_bringup(void) {
+    // Drive the BMI270 mode/address pins before any communication so the
+    // module needs no external pull resistors:
+    //   CSB high → I2C mode,  SA0 low → address 0x68
+    // A falling edge on CSB latches the BMI270 into SPI mode until the next
+    // power-on, so CSB must never glitch low. Preset the output latches BEFORE
+    // switching the pins to output (otherwise output mode drives 0 first), and
+    // enable a pull-up on CSB to bias it high through the boot window.
+    gpio_set_level(IMU_CSB_GPIO, 1);   // preset CSB latch high
+    gpio_set_level(IMU_ADDR_GPIO, 0);  // preset SA0 latch low
+    gpio_config_t imu_pins = {
+        .pin_bit_mask = (1ULL << IMU_CSB_GPIO) | (1ULL << IMU_ADDR_GPIO),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&imu_pins);
+    gpio_set_level(IMU_CSB_GPIO, 1);   // I2C mode
+    gpio_set_level(IMU_ADDR_GPIO, 0);  // address 0x68
+    vTaskDelay(pdMS_TO_TICKS(5)); // let BMI270 settle into I2C mode
+
+    i2c_config_t cfg = {
+        .mode             = I2C_MODE_MASTER,
+        .sda_io_num       = IMU_SDA_GPIO,
+        .scl_io_num       = IMU_SCL_GPIO,
+        .sda_pullup_en    = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en    = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = IMU_I2C_FREQ,
+    };
+    ESP_ERROR_CHECK(i2c_param_config(IMU_I2C_PORT, &cfg));
+    ESP_ERROR_CHECK(i2c_driver_install(IMU_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0));
+
+    i2c_bus_scan();
+
+    s_bmi2.read           = bmi2_i2c_read;
+    s_bmi2.write          = bmi2_i2c_write;
+    s_bmi2.delay_us       = bmi2_delay_us_cb;
+    s_bmi2.intf_ptr       = NULL;
+    s_bmi2.intf           = BMI2_I2C_INTF;
+    s_bmi2.read_write_len = 32;
+
+    return configure_bmi270_sensors();
 }
 
 // --------------------------------------------------------------------------
@@ -438,19 +448,25 @@ const char *imu_accel_foc_axis_label(imu_accel_foc_axis_t axis) {
     }
 }
 
-// Sign convention per the wrapper library's tested behavior
-// (SparkFun_BMI270_Arduino_Library.cpp, performAccelOffsetCalibration): a
-// "positive" gravity direction maps to sign=1, the opposite of the stale doc
-// comment on struct bmi2_accel_foc_g_value in bmi2_defs.h.
+// Sign convention verified against bmi2.c's own validation, not just the doc
+// comment: verify_foc_position() (bmi2.c ~line 11519) inverts the just-read
+// sample (multiplies by -1) only when sign==1 for the matched axis, then
+// checks the result against +1g -- i.e. sign==1 asserts "this axis currently
+// reads negative" and sign==0 asserts "reads positive". (An earlier version
+// of this code used the opposite convention, copied from
+// SparkFun_BMI270_Arduino_Library.cpp's performAccelOffsetCalibration
+// wrapper -- that wrapper's mapping does not match the underlying bmi2.c
+// validation and caused BMI2_E_INVALID_FOC_POSITION on real hardware even
+// with a correct axis/orientation.)
 static struct bmi2_accel_foc_g_value accel_foc_g_value_from_axis(imu_accel_foc_axis_t axis) {
     switch (axis) {
-        case IMU_ACCEL_FOC_AXIS_POS_X: return (struct bmi2_accel_foc_g_value){ .x = 1, .y = 0, .z = 0, .sign = 1 };
-        case IMU_ACCEL_FOC_AXIS_NEG_X: return (struct bmi2_accel_foc_g_value){ .x = 1, .y = 0, .z = 0, .sign = 0 };
-        case IMU_ACCEL_FOC_AXIS_POS_Y: return (struct bmi2_accel_foc_g_value){ .x = 0, .y = 1, .z = 0, .sign = 1 };
-        case IMU_ACCEL_FOC_AXIS_NEG_Y: return (struct bmi2_accel_foc_g_value){ .x = 0, .y = 1, .z = 0, .sign = 0 };
-        case IMU_ACCEL_FOC_AXIS_POS_Z: return (struct bmi2_accel_foc_g_value){ .x = 0, .y = 0, .z = 1, .sign = 1 };
+        case IMU_ACCEL_FOC_AXIS_POS_X: return (struct bmi2_accel_foc_g_value){ .x = 1, .y = 0, .z = 0, .sign = 0 };
+        case IMU_ACCEL_FOC_AXIS_NEG_X: return (struct bmi2_accel_foc_g_value){ .x = 1, .y = 0, .z = 0, .sign = 1 };
+        case IMU_ACCEL_FOC_AXIS_POS_Y: return (struct bmi2_accel_foc_g_value){ .x = 0, .y = 1, .z = 0, .sign = 0 };
+        case IMU_ACCEL_FOC_AXIS_NEG_Y: return (struct bmi2_accel_foc_g_value){ .x = 0, .y = 1, .z = 0, .sign = 1 };
+        case IMU_ACCEL_FOC_AXIS_POS_Z: return (struct bmi2_accel_foc_g_value){ .x = 0, .y = 0, .z = 1, .sign = 0 };
         case IMU_ACCEL_FOC_AXIS_NEG_Z:
-        default:                       return (struct bmi2_accel_foc_g_value){ .x = 0, .y = 0, .z = 1, .sign = 0 };
+        default:                       return (struct bmi2_accel_foc_g_value){ .x = 0, .y = 0, .z = 1, .sign = 1 };
     }
 }
 
@@ -506,6 +522,17 @@ esp_err_t imu_run_hw_foc_calibration(uint32_t sample_window_ms,
         ESP_LOGE(TAG, "bmi2_nvm_prog failed: %d -- offsets active this power cycle only, will NOT survive reboot", rslt);
     else
         ESP_LOGI(TAG, "offsets committed to BMI270 NVM -- persists across reboot");
+
+    // bmi2_nvm_prog() ends with bmi2_soft_reset() whenever it reaches that
+    // point (i.e. whenever nvm_ok is true, and possibly even on some failure
+    // paths) -- a soft reset reverts the chip to power-on defaults, disabling
+    // accel/gyro entirely. Without this, every read for the rest of the
+    // session -- including the "after" snapshot below and the normal
+    // streaming pipeline -- would silently come back as zeros until reboot.
+    if (configure_bmi270_sensors() != ESP_OK) {
+        ESP_LOGE(TAG, "failed to reconfigure BMI270 after NVM commit -- IMU is now dead until reboot");
+        return ESP_FAIL;
+    }
 
     uint32_t count = imu_foc_run_count_bump();
     if (foc_run_count_out) *foc_run_count_out = count;
