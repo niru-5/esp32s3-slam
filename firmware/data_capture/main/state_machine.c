@@ -24,20 +24,80 @@ static bool        s_sdcard_available  = false;
 // --------------------------------------------------------------------------
 // IMU calibration — hardware bias/offset only (BMI270 FOC + NVM commit, see
 // imu.h imu_run_hw_foc_calibration). Runs synchronously on this task, same as
-// every other transition here; the whole thing takes ~2*CONFIG_IMU_CALIBRATION_
-// WINDOW_MS plus a fraction of a second for FOC/NVM itself, short enough not
-// to worry about console command polling stalling. Noise-density/random-walk/
-// Allan-variance work is not implemented -- see docs/calibration.md.
+// every other transition here. Accel FOC needs to know which axis gravity is
+// aligned with (bmi2_perform_accel_foc has no way to detect orientation
+// itself — see docs/calibration.md) so this walks the operator through it:
+// show a handful of live raw samples, explain the axis/sign encoding, then
+// block waiting for one digit. That block is a deliberate use of the console
+// as "a human-in-the-loop bring-up/test control channel, not a real-time
+// path" (see state_machine.h) — nothing else needs this task to keep
+// running promptly while it waits.
 //
-// Camera calibration is still a provisioning stub.
+// Noise-density/random-walk/Allan-variance work is not implemented -- see
+// docs/calibration.md. Camera calibration is still a provisioning stub.
 // --------------------------------------------------------------------------
 
+// Block until the operator sends one non-blank byte, reusing the same
+// non-blocking stdin main_state_machine_task already configured. '\n'/'\r'
+// are skipped rather than treated as an answer -- the command that got us
+// here (e.g. "4\n" from a line-buffered terminal) can leave one buffered,
+// and without this it would be misread as the operator's answer before they
+// ever see the prompt.
+static int wait_for_console_digit(void) {
+    int c;
+    while (1) {
+        c = fgetc(stdin);
+        if (c == EOF) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
+        if (c == '\n' || c == '\r') continue;
+        return c;
+    }
+}
+
+// Show 10 raw samples over ~100ms and let the operator pick which axis is
+// reading ~1g. Returns false (calibration aborted, caller should bail
+// without touching the BMI270) if the operator sends anything but '1'-'6'.
+static bool select_gravity_axis(imu_accel_foc_axis_t *out) {
+    ESP_LOGI(TAG, "Hold the rig stationary. Sampling accel/gyro to help pick the gravity axis...");
+
+    imu_raw_preview_sample_t preview[10];
+    if (imu_preview_raw_samples(preview, 10, 10) != ESP_OK) {
+        ESP_LOGE(TAG, "preview capture failed -- aborting calibration");
+        return false;
+    }
+    float ax_sum = 0, ay_sum = 0, az_sum = 0;
+    for (int i = 0; i < 10; i++) {
+        ESP_LOGI(TAG, "  sample %2d: accel g = (% .4f, % .4f, % .4f)  gyro dps = (% .4f, % .4f, % .4f)",
+                 i, (double)preview[i].ax, (double)preview[i].ay, (double)preview[i].az,
+                 (double)preview[i].gx, (double)preview[i].gy, (double)preview[i].gz);
+        ax_sum += preview[i].ax; ay_sum += preview[i].ay; az_sum += preview[i].az;
+    }
+    ESP_LOGI(TAG, "  mean accel g = (% .4f, % .4f, % .4f) — whichever axis reads closest to +-1.0 "
+                  "is the one gravity is pulling along; the sign tells you which direction",
+             (double)(ax_sum / 10), (double)(ay_sum / 10), (double)(az_sum / 10));
+
+    ESP_LOGI(TAG, "Select that axis+sign: 1=+X 2=-X 3=+Y 4=-Y 5=+Z 6=-Z  (anything else aborts)");
+    ESP_LOGI(TAG, "Send one digit now:");
+
+    int c = wait_for_console_digit();
+    if (c < '1' || c > '6') {
+        ESP_LOGW(TAG, "calibration aborted (got 0x%02x, expected 1-6)", (unsigned)c);
+        return false;
+    }
+    *out = (imu_accel_foc_axis_t)(c - '0');
+    ESP_LOGI(TAG, "Using %s as the gravity axis for accel FOC", imu_accel_foc_axis_label(*out));
+    return true;
+}
+
 static void imu_calibration_run(void) {
+    ESP_LOGI(TAG, "=== IMU hardware FOC calibration ===");
+
+    imu_accel_foc_axis_t gravity_axis;
+    if (!select_gravity_axis(&gravity_axis)) return;
+
     imu_stationary_stats_t before, after;
     uint32_t foc_run_count = 0;
 
-    ESP_LOGI(TAG, "=== IMU hardware FOC calibration — place the rig flat and still ===");
-    esp_err_t err = imu_run_hw_foc_calibration(CONFIG_IMU_CALIBRATION_WINDOW_MS,
+    esp_err_t err = imu_run_hw_foc_calibration(CONFIG_IMU_CALIBRATION_WINDOW_MS, gravity_axis,
                                                 &before, &after, &foc_run_count);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "IMU calibration failed or NVM commit didn't stick (err=%s) — see log above",
@@ -48,8 +108,8 @@ static void imu_calibration_run(void) {
     char report[1024];
     int n = snprintf(report, sizeof(report),
         "IMU hardware FOC calibration report\n"
-        "foc_run_count=%lu  local_gravity_mps2=%.4f (CONFIG_LOCAL_GRAVITY_MPS2, Belgium estimate — "
-        "annotation only, not fed into the BMI270 FOC call)\n"
+        "foc_run_count=%lu  gravity_axis=%s  local_gravity_mps2=%.4f (CONFIG_LOCAL_GRAVITY_MPS2, "
+        "Belgium estimate — annotation only, not fed into the BMI270 FOC call)\n"
         "\n"
         "BEFORE (n=%lu samples):\n"
         "  accel g   x=%.5f y=%.5f z=%.5f   std x=%.5f y=%.5f z=%.5f\n"
@@ -62,7 +122,7 @@ static void imu_calibration_run(void) {
         "NOTE: bias/offset only. White-noise density, bias random walk, and\n"
         "Allan-variance characterization are not yet implemented — see\n"
         "docs/calibration.md.\n",
-        (unsigned long)foc_run_count, (double)CONFIG_LOCAL_GRAVITY_MPS2,
+        (unsigned long)foc_run_count, imu_accel_foc_axis_label(gravity_axis), (double)CONFIG_LOCAL_GRAVITY_MPS2,
         (unsigned long)before.sample_count,
         (double)before.ax_mean, (double)before.ay_mean, (double)before.az_mean,
         (double)before.ax_std,  (double)before.ay_std,  (double)before.az_std,

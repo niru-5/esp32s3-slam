@@ -406,6 +406,54 @@ esp_err_t imu_capture_stationary_stats(uint32_t duration_ms, imu_stationary_stat
     return ESP_OK;
 }
 
+esp_err_t imu_preview_raw_samples(imu_raw_preview_sample_t *out, uint32_t count, uint32_t period_ms) {
+    if (!out || count == 0) return ESP_ERR_INVALID_ARG;
+
+    for (uint32_t i = 0; i < count; i++) {
+        struct bmi2_sens_data raw;
+        memset(&raw, 0, sizeof(raw));
+        if (bmi2_get_sensor_data(&raw, &s_bmi2) != BMI2_OK) return ESP_FAIL;
+
+        out[i].ax = (float)raw.acc.x * s_raw_to_gs;
+        out[i].ay = (float)raw.acc.y * s_raw_to_gs;
+        out[i].az = (float)raw.acc.z * s_raw_to_gs;
+        out[i].gx = (float)raw.gyr.x * s_raw_to_dps;
+        out[i].gy = (float)raw.gyr.y * s_raw_to_dps;
+        out[i].gz = (float)raw.gyr.z * s_raw_to_dps;
+
+        if (i + 1 < count) vTaskDelay(pdMS_TO_TICKS(period_ms));
+    }
+    return ESP_OK;
+}
+
+const char *imu_accel_foc_axis_label(imu_accel_foc_axis_t axis) {
+    switch (axis) {
+        case IMU_ACCEL_FOC_AXIS_POS_X: return "+X";
+        case IMU_ACCEL_FOC_AXIS_NEG_X: return "-X";
+        case IMU_ACCEL_FOC_AXIS_POS_Y: return "+Y";
+        case IMU_ACCEL_FOC_AXIS_NEG_Y: return "-Y";
+        case IMU_ACCEL_FOC_AXIS_POS_Z: return "+Z";
+        case IMU_ACCEL_FOC_AXIS_NEG_Z: return "-Z";
+        default:                       return "?";
+    }
+}
+
+// Sign convention per the wrapper library's tested behavior
+// (SparkFun_BMI270_Arduino_Library.cpp, performAccelOffsetCalibration): a
+// "positive" gravity direction maps to sign=1, the opposite of the stale doc
+// comment on struct bmi2_accel_foc_g_value in bmi2_defs.h.
+static struct bmi2_accel_foc_g_value accel_foc_g_value_from_axis(imu_accel_foc_axis_t axis) {
+    switch (axis) {
+        case IMU_ACCEL_FOC_AXIS_POS_X: return (struct bmi2_accel_foc_g_value){ .x = 1, .y = 0, .z = 0, .sign = 1 };
+        case IMU_ACCEL_FOC_AXIS_NEG_X: return (struct bmi2_accel_foc_g_value){ .x = 1, .y = 0, .z = 0, .sign = 0 };
+        case IMU_ACCEL_FOC_AXIS_POS_Y: return (struct bmi2_accel_foc_g_value){ .x = 0, .y = 1, .z = 0, .sign = 1 };
+        case IMU_ACCEL_FOC_AXIS_NEG_Y: return (struct bmi2_accel_foc_g_value){ .x = 0, .y = 1, .z = 0, .sign = 0 };
+        case IMU_ACCEL_FOC_AXIS_POS_Z: return (struct bmi2_accel_foc_g_value){ .x = 0, .y = 0, .z = 1, .sign = 1 };
+        case IMU_ACCEL_FOC_AXIS_NEG_Z:
+        default:                       return (struct bmi2_accel_foc_g_value){ .x = 0, .y = 0, .z = 1, .sign = 0 };
+    }
+}
+
 // Bumps a persistent run counter in NVS and returns the new value (0 if NVS
 // itself is unavailable -- calibration still proceeds, it just loses the
 // "how many times has this chip been FOC'd" warning).
@@ -425,6 +473,7 @@ static uint32_t imu_foc_run_count_bump(void) {
 }
 
 esp_err_t imu_run_hw_foc_calibration(uint32_t sample_window_ms,
+                                      imu_accel_foc_axis_t gravity_axis,
                                       imu_stationary_stats_t *before_out,
                                       imu_stationary_stats_t *after_out,
                                       uint32_t *foc_run_count_out) {
@@ -435,14 +484,8 @@ esp_err_t imu_run_hw_foc_calibration(uint32_t sample_window_ms,
     esp_err_t err = imu_capture_stationary_stats(sample_window_ms, before_out);
     if (err != ESP_OK) return err;
 
-    // Rig assumed flat with the BMI270's +Z axis facing up. Note the wrapper
-    // library's tested convention (SparkFun_BMI270_Arduino_Library.cpp,
-    // performAccelOffsetCalibration) maps "positive gravity direction" to
-    // sign=1, the opposite of the stale doc comment on struct
-    // bmi2_accel_foc_g_value in bmi2_defs.h -- sign=1 here is deliberate, not
-    // a typo. If this rig's mounting has the chip's Z axis pointing down
-    // instead, flip to sign=0.
-    struct bmi2_accel_foc_g_value g_dir = { .x = 0, .y = 0, .z = 1, .sign = 1 };
+    ESP_LOGI(TAG, "running accel FOC with gravity axis = %s", imu_accel_foc_axis_label(gravity_axis));
+    struct bmi2_accel_foc_g_value g_dir = accel_foc_g_value_from_axis(gravity_axis);
     int8_t rslt = bmi2_perform_accel_foc(&g_dir, &s_bmi2);
     if (rslt != BMI2_OK) {
         ESP_LOGE(TAG, "accel FOC failed: %d", rslt);

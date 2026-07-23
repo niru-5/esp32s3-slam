@@ -111,12 +111,45 @@ typedef struct {
 // read (chip not initialized, or I2C errors throughout the window).
 esp_err_t imu_capture_stationary_stats(uint32_t duration_ms, imu_stationary_stats_t *out);
 
+typedef struct {
+    float ax, ay, az;   // g
+    float gx, gy, gz;   // deg/s
+} imu_raw_preview_sample_t;
+
+// Poll the BMI270 directly for `count` raw samples, spaced period_ms apart,
+// with no averaging -- used to show an operator a live look at each axis
+// (e.g. 10 samples over 100ms) so they can tell which one reads ~1g before
+// picking a gravity axis for imu_run_hw_foc_calibration(). Returns ESP_FAIL
+// on the first I2C read failure.
+esp_err_t imu_preview_raw_samples(imu_raw_preview_sample_t *out, uint32_t count, uint32_t period_ms);
+
+// Which axis (and sign) the operator has identified as aligned with gravity
+// with the rig held stationary -- fed into bmi2_perform_accel_foc. Values
+// are deliberately 1-6 so a console digit '1'..'6' casts straight across
+// (see state_machine.c imu_calibration_run()).
+typedef enum {
+    IMU_ACCEL_FOC_AXIS_POS_X = 1,
+    IMU_ACCEL_FOC_AXIS_NEG_X,
+    IMU_ACCEL_FOC_AXIS_POS_Y,
+    IMU_ACCEL_FOC_AXIS_NEG_Y,
+    IMU_ACCEL_FOC_AXIS_POS_Z,
+    IMU_ACCEL_FOC_AXIS_NEG_Z,
+} imu_accel_foc_axis_t;
+
+// Human-readable label ("+X".."−Z") for logging/report text.
+const char *imu_accel_foc_axis_label(imu_accel_foc_axis_t axis);
+
 // One-shot hardware bias calibration:
 //   1. capture stationary stats ("before")
-//   2. bmi2_perform_accel_foc (rig assumed flat, chip +Z axis up) +
-//      bmi2_perform_gyro_foc -- both auto-enable offset compensation on the
-//      live data path as part of the routine, so no other firmware change is
-//      needed for the correction to take effect
+//   2. bmi2_perform_accel_foc, using gravity_axis as the axis/sign gravity
+//      is aligned with (the operator determines this by eye from
+//      imu_preview_raw_samples() -- FOC has no way to detect orientation
+//      itself, it only computes the offset needed to make the axis you tell
+//      it read exactly +-1g) + bmi2_perform_gyro_foc (no orientation
+//      dependency -- ideal stationary reading is 0 on every axis). Both
+//      auto-enable offset compensation on the live data path as part of the
+//      routine, so no other firmware change is needed for the correction to
+//      take effect.
 //   3. bmi2_nvm_prog to persist the resulting offset registers so they
 //      survive power-cycles
 //   4. capture stationary stats again ("after"), to confirm it helped
@@ -128,6 +161,7 @@ esp_err_t imu_capture_stationary_stats(uint32_t duration_ms, imu_stationary_stat
 // succeeded; if NVM commit failed the offsets are still active for this
 // power cycle (FOC applies them immediately) but will NOT survive a reboot.
 esp_err_t imu_run_hw_foc_calibration(uint32_t sample_window_ms,
+                                      imu_accel_foc_axis_t gravity_axis,
                                       imu_stationary_stats_t *before_out,
                                       imu_stationary_stats_t *after_out,
                                       uint32_t *foc_run_count_out);
