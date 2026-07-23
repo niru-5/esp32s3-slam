@@ -1,6 +1,8 @@
 #include "imu.h"
 
 #include <string.h>
+#include <math.h>
+#include <stdbool.h>
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_rom_sys.h"
@@ -9,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "nvs.h"
 
 #include "config.h"
 #include "bmi270.h"
@@ -342,4 +345,134 @@ size_t imu_serialize_wire(const imu_sample_t *samples, uint32_t count,
         memcpy(p, &samples[i].gz,        4); p += 4;
     }
     return (size_t)(p - out);
+}
+
+// --------------------------------------------------------------------------
+// Bias/offset calibration (see imu.h). Polls s_bmi2 directly -- only safe
+// while imu_capture_task isn't also reading it, which state_machine.c
+// guarantees by tearing down any active pipeline before entering
+// APP_STATE_IMU_CALIBRATION.
+// --------------------------------------------------------------------------
+
+#define IMU_CALIB_NVS_NAMESPACE "imu_calib"
+#define IMU_CALIB_NVS_KEY_FOC_COUNT "foc_count"
+
+esp_err_t imu_capture_stationary_stats(uint32_t duration_ms, imu_stationary_stats_t *out) {
+    if (!out) return ESP_ERR_INVALID_ARG;
+    memset(out, 0, sizeof(*out));
+
+    double sum[6] = {0}, sumsq[6] = {0};
+    uint32_t n = 0;
+    int64_t deadline_us = esp_timer_get_time() + (int64_t)duration_ms * 1000;
+
+    // 10ms poll period: comfortably below the BMI270's 1600Hz ODR (no risk
+    // of re-reading a stale sample) and, unlike a busy-wait, lets the
+    // scheduler/idle task run each iteration -- this loop blocks the calling
+    // task for seconds at a time, which is fine for a synchronous console
+    // command but would trip the watchdog if done with esp_rom_delay_us.
+    while (esp_timer_get_time() < deadline_us) {
+        struct bmi2_sens_data raw;
+        memset(&raw, 0, sizeof(raw));
+        if (bmi2_get_sensor_data(&raw, &s_bmi2) == BMI2_OK) {
+            float vals[6] = {
+                (float)raw.acc.x * s_raw_to_gs,  (float)raw.acc.y * s_raw_to_gs,  (float)raw.acc.z * s_raw_to_gs,
+                (float)raw.gyr.x * s_raw_to_dps, (float)raw.gyr.y * s_raw_to_dps, (float)raw.gyr.z * s_raw_to_dps,
+            };
+            for (int i = 0; i < 6; i++) {
+                sum[i]   += vals[i];
+                sumsq[i] += (double)vals[i] * (double)vals[i];
+            }
+            n++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (n == 0) {
+        ESP_LOGE(TAG, "stationary-stats capture read zero samples");
+        return ESP_FAIL;
+    }
+
+    double mean[6], var[6];
+    for (int i = 0; i < 6; i++) {
+        mean[i] = sum[i] / n;
+        var[i]  = sumsq[i] / n - mean[i] * mean[i];
+        if (var[i] < 0) var[i] = 0;  // guard float rounding, not a real negative variance
+    }
+
+    out->sample_count = n;
+    out->ax_mean = (float)mean[0]; out->ay_mean = (float)mean[1]; out->az_mean = (float)mean[2];
+    out->gx_mean = (float)mean[3]; out->gy_mean = (float)mean[4]; out->gz_mean = (float)mean[5];
+    out->ax_std  = sqrtf((float)var[0]); out->ay_std = sqrtf((float)var[1]); out->az_std = sqrtf((float)var[2]);
+    out->gx_std  = sqrtf((float)var[3]); out->gy_std = sqrtf((float)var[4]); out->gz_std = sqrtf((float)var[5]);
+    return ESP_OK;
+}
+
+// Bumps a persistent run counter in NVS and returns the new value (0 if NVS
+// itself is unavailable -- calibration still proceeds, it just loses the
+// "how many times has this chip been FOC'd" warning).
+static uint32_t imu_foc_run_count_bump(void) {
+    nvs_handle_t h;
+    if (nvs_open(IMU_CALIB_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGW(TAG, "NVS open failed -- can't track FOC run count");
+        return 0;
+    }
+    uint32_t count = 0;
+    nvs_get_u32(h, IMU_CALIB_NVS_KEY_FOC_COUNT, &count);  // leaves count=0 if key absent
+    count++;
+    nvs_set_u32(h, IMU_CALIB_NVS_KEY_FOC_COUNT, count);
+    nvs_commit(h);
+    nvs_close(h);
+    return count;
+}
+
+esp_err_t imu_run_hw_foc_calibration(uint32_t sample_window_ms,
+                                      imu_stationary_stats_t *before_out,
+                                      imu_stationary_stats_t *after_out,
+                                      uint32_t *foc_run_count_out) {
+    if (!before_out || !after_out) return ESP_ERR_INVALID_ARG;
+
+    ESP_LOGI(TAG, "capturing BEFORE stats (%lu ms) -- hold the rig flat and still",
+             (unsigned long)sample_window_ms);
+    esp_err_t err = imu_capture_stationary_stats(sample_window_ms, before_out);
+    if (err != ESP_OK) return err;
+
+    // Rig assumed flat with the BMI270's +Z axis facing up. Note the wrapper
+    // library's tested convention (SparkFun_BMI270_Arduino_Library.cpp,
+    // performAccelOffsetCalibration) maps "positive gravity direction" to
+    // sign=1, the opposite of the stale doc comment on struct
+    // bmi2_accel_foc_g_value in bmi2_defs.h -- sign=1 here is deliberate, not
+    // a typo. If this rig's mounting has the chip's Z axis pointing down
+    // instead, flip to sign=0.
+    struct bmi2_accel_foc_g_value g_dir = { .x = 0, .y = 0, .z = 1, .sign = 1 };
+    int8_t rslt = bmi2_perform_accel_foc(&g_dir, &s_bmi2);
+    if (rslt != BMI2_OK) {
+        ESP_LOGE(TAG, "accel FOC failed: %d", rslt);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "accel FOC ok");
+
+    rslt = bmi2_perform_gyro_foc(&s_bmi2);
+    if (rslt != BMI2_OK) {
+        ESP_LOGE(TAG, "gyro FOC failed: %d", rslt);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "gyro FOC ok");
+
+    rslt = bmi2_nvm_prog(&s_bmi2);
+    bool nvm_ok = (rslt == BMI2_OK);
+    if (!nvm_ok)
+        ESP_LOGE(TAG, "bmi2_nvm_prog failed: %d -- offsets active this power cycle only, will NOT survive reboot", rslt);
+    else
+        ESP_LOGI(TAG, "offsets committed to BMI270 NVM -- persists across reboot");
+
+    uint32_t count = imu_foc_run_count_bump();
+    if (foc_run_count_out) *foc_run_count_out = count;
+    if (count > 1)
+        ESP_LOGW(TAG, "this is FOC+NVM run #%lu on this chip -- NVM write endurance is limited, "
+                       "recalibrate only when actually needed", (unsigned long)count);
+
+    ESP_LOGI(TAG, "capturing AFTER stats (%lu ms)", (unsigned long)sample_window_ms);
+    err = imu_capture_stationary_stats(sample_window_ms, after_out);
+    if (err != ESP_OK) return err;
+
+    return nvm_ok ? ESP_OK : ESP_ERR_INVALID_STATE;
 }

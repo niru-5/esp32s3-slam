@@ -38,25 +38,30 @@ static char s_stats_dir[56];
 static TaskHandle_t s_imu_consumer_handle    = NULL;
 static TaskHandle_t s_camera_consumer_handle = NULL;
 
-// Find (and create) a fresh session directory, named from wall-clock time
-// (data_capture.c syncs it over SNTP before sdcard_init runs) so sessions
-// sort chronologically and are identifiable without cross-referencing boot
-// logs. If SNTP never synced (no WiFi / no internet that boot), time(NULL)
-// is still epoch-relative — fall back to a boot-relative name instead of
-// writing every session into "19700101-000000".
-static esp_err_t make_session_dir(void) {
-    DEBUG_TIME_START(t0);
-
-    char base[32];
+// Wall-clock timestamp tag (data_capture.c syncs it over SNTP before
+// sdcard_init runs), used for both the session directory name and one-off
+// file names so they sort chronologically and are identifiable without
+// cross-referencing boot logs. If SNTP never synced (no WiFi / no internet
+// that boot), time(NULL) is still epoch-relative — fall back to a
+// boot-relative tag instead of writing "19700101-000000".
+static void format_timestamp_tag(char *out, size_t out_sz) {
     time_t now = time(NULL);
     if (now > 1577836800) {  // > 2020-01-01 => a real sync happened
         struct tm tm_info;
         localtime_r(&now, &tm_info);
-        strftime(base, sizeof(base), "%Y%m%d-%H%M%S", &tm_info);
+        strftime(out, out_sz, "%Y%m%d-%H%M%S", &tm_info);
     } else {
-        ESP_LOGW(TAG, "no wall-clock time available — session folder will use a boot-relative name");
-        snprintf(base, sizeof(base), "boot_%010" PRId64, esp_timer_get_time() / 1000);
+        ESP_LOGW(TAG, "no wall-clock time available — using a boot-relative name");
+        snprintf(out, out_sz, "boot_%010" PRId64, esp_timer_get_time() / 1000);
     }
+}
+
+// Find (and create) a fresh session directory.
+static esp_err_t make_session_dir(void) {
+    DEBUG_TIME_START(t0);
+
+    char base[32];
+    format_timestamp_tag(base, sizeof(base));
 
     // Suffix with an index on collision (e.g. two boots within the same
     // second, or SNTP never synced so every boot hits the same "boot_..."
@@ -202,6 +207,30 @@ static void camera_sdcard_consumer_task(void *arg) {
 // --------------------------------------------------------------------------
 // Public API
 // --------------------------------------------------------------------------
+
+esp_err_t sdcard_write_imu_calibration_report(const char *text, size_t len) {
+    char tag[32];
+    format_timestamp_tag(tag, sizeof(tag));
+
+    // Written at the SD root, not inside a session directory -- calibration
+    // is a standalone operator action, not a capture session.
+    char path[80];
+    snprintf(path, sizeof(path), SD_MOUNT_POINT "/imu_calibration_%s.txt", tag);
+
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        ESP_LOGE(TAG, "open %s failed: %s", path, strerror(errno));
+        return ESP_FAIL;
+    }
+    size_t written = fwrite(text, 1, len, f);
+    fclose(f);
+    if (written != len) {
+        ESP_LOGW(TAG, "short write on %s (%u/%u bytes)", path, (unsigned)written, (unsigned)len);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "wrote calibration report to %s", path);
+    return ESP_OK;
+}
 
 esp_err_t sdcard_init(void) {
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();

@@ -85,3 +85,49 @@ uint32_t imu_queue_overflow_count(void);
 // of bytes written.
 size_t imu_serialize_wire(const imu_sample_t *samples, uint32_t count,
                           int64_t ref_esp_us, uint32_t ref_ticks, uint8_t *out);
+
+// --------------------------------------------------------------------------
+// Bias/offset calibration (state_machine.c command 4). Separate from the
+// imu_queue pipeline above -- these poll the BMI270 directly, so only call
+// them while imu_pipeline_start() is NOT running (state_machine.c already
+// tears down any active pipeline before entering APP_STATE_IMU_CALIBRATION).
+//
+// This covers offset/bias only. Noise-density (white noise) and bias
+// random-walk coefficients, and Allan-variance characterization, are future
+// work -- see docs/calibration.md.
+// --------------------------------------------------------------------------
+
+typedef struct {
+    uint32_t sample_count;
+    float ax_mean, ay_mean, az_mean;   // g
+    float gx_mean, gy_mean, gz_mean;   // deg/s
+    float ax_std,  ay_std,  az_std;    // g      -- stationarity check
+    float gx_std,  gy_std,  gz_std;    // deg/s  -- stationarity check
+} imu_stationary_stats_t;
+
+// Poll the BMI270 directly for duration_ms and return per-axis mean/stddev.
+// The rig must be held flat and still for the result to mean anything --
+// large stddev values mean it wasn't. Returns ESP_FAIL if no samples were
+// read (chip not initialized, or I2C errors throughout the window).
+esp_err_t imu_capture_stationary_stats(uint32_t duration_ms, imu_stationary_stats_t *out);
+
+// One-shot hardware bias calibration:
+//   1. capture stationary stats ("before")
+//   2. bmi2_perform_accel_foc (rig assumed flat, chip +Z axis up) +
+//      bmi2_perform_gyro_foc -- both auto-enable offset compensation on the
+//      live data path as part of the routine, so no other firmware change is
+//      needed for the correction to take effect
+//   3. bmi2_nvm_prog to persist the resulting offset registers so they
+//      survive power-cycles
+//   4. capture stationary stats again ("after"), to confirm it helped
+//
+// BMI270 NVM write endurance is limited -- this bumps a persistent NVS
+// counter (*foc_run_count_out) each call and logs a warning past the first,
+// so it stays a rare, deliberate operation rather than something run on
+// every boot. Returns ESP_OK only if FOC succeeded AND the NVM commit
+// succeeded; if NVM commit failed the offsets are still active for this
+// power cycle (FOC applies them immediately) but will NOT survive a reboot.
+esp_err_t imu_run_hw_foc_calibration(uint32_t sample_window_ms,
+                                      imu_stationary_stats_t *before_out,
+                                      imu_stationary_stats_t *after_out,
+                                      uint32_t *foc_run_count_out);

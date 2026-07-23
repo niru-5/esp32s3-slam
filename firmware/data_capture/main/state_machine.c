@@ -22,13 +22,64 @@ static app_state_t s_state             = APP_STATE_IDLE;
 static bool        s_sdcard_available  = false;
 
 // --------------------------------------------------------------------------
-// Calibration stubs — provisioning only. The exact procedure (duration,
-// what's recorded, whether it needs its own task) is deferred until that
-// work starts; for now entering the state just logs and returns to IDLE.
+// IMU calibration — hardware bias/offset only (BMI270 FOC + NVM commit, see
+// imu.h imu_run_hw_foc_calibration). Runs synchronously on this task, same as
+// every other transition here; the whole thing takes ~2*CONFIG_IMU_CALIBRATION_
+// WINDOW_MS plus a fraction of a second for FOC/NVM itself, short enough not
+// to worry about console command polling stalling. Noise-density/random-walk/
+// Allan-variance work is not implemented -- see docs/calibration.md.
+//
+// Camera calibration is still a provisioning stub.
 // --------------------------------------------------------------------------
 
 static void imu_calibration_run(void) {
-    ESP_LOGW(TAG, "IMU calibration not implemented yet");
+    imu_stationary_stats_t before, after;
+    uint32_t foc_run_count = 0;
+
+    ESP_LOGI(TAG, "=== IMU hardware FOC calibration — place the rig flat and still ===");
+    esp_err_t err = imu_run_hw_foc_calibration(CONFIG_IMU_CALIBRATION_WINDOW_MS,
+                                                &before, &after, &foc_run_count);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "IMU calibration failed or NVM commit didn't stick (err=%s) — see log above",
+                 esp_err_to_name(err));
+        return;
+    }
+
+    char report[1024];
+    int n = snprintf(report, sizeof(report),
+        "IMU hardware FOC calibration report\n"
+        "foc_run_count=%lu  local_gravity_mps2=%.4f (CONFIG_LOCAL_GRAVITY_MPS2, Belgium estimate — "
+        "annotation only, not fed into the BMI270 FOC call)\n"
+        "\n"
+        "BEFORE (n=%lu samples):\n"
+        "  accel g   x=%.5f y=%.5f z=%.5f   std x=%.5f y=%.5f z=%.5f\n"
+        "  gyro  dps x=%.5f y=%.5f z=%.5f   std x=%.5f y=%.5f z=%.5f\n"
+        "\n"
+        "AFTER (n=%lu samples, hardware FOC + offset comp applied, committed to NVM):\n"
+        "  accel g   x=%.5f y=%.5f z=%.5f   std x=%.5f y=%.5f z=%.5f\n"
+        "  gyro  dps x=%.5f y=%.5f z=%.5f   std x=%.5f y=%.5f z=%.5f\n"
+        "\n"
+        "NOTE: bias/offset only. White-noise density, bias random walk, and\n"
+        "Allan-variance characterization are not yet implemented — see\n"
+        "docs/calibration.md.\n",
+        (unsigned long)foc_run_count, (double)CONFIG_LOCAL_GRAVITY_MPS2,
+        (unsigned long)before.sample_count,
+        (double)before.ax_mean, (double)before.ay_mean, (double)before.az_mean,
+        (double)before.ax_std,  (double)before.ay_std,  (double)before.az_std,
+        (double)before.gx_mean, (double)before.gy_mean, (double)before.gz_mean,
+        (double)before.gx_std,  (double)before.gy_std,  (double)before.gz_std,
+        (unsigned long)after.sample_count,
+        (double)after.ax_mean, (double)after.ay_mean, (double)after.az_mean,
+        (double)after.ax_std,  (double)after.ay_std,  (double)after.az_std,
+        (double)after.gx_mean, (double)after.gy_mean, (double)after.gz_mean,
+        (double)after.gx_std,  (double)after.gy_std,  (double)after.gz_std);
+
+    ESP_LOGI(TAG, "\n%s", report);
+    if (s_sdcard_available) {
+        sdcard_write_imu_calibration_report(report, (size_t)n);
+    } else {
+        ESP_LOGW(TAG, "SD card unavailable — calibration report only in the serial log above");
+    }
 }
 
 static void camera_calibration_run(void) {
