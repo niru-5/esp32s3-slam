@@ -59,6 +59,15 @@ static void wifi_start(void) {
     // frames + IMU every cycle), not power-constrained, so keep the radio
     // fully awake.
     esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_err_t err = esp_wifi_set_bandwidth(WIFI_IF_STA, 2);
+    ESP_LOGI(TAG, "************************************************************");
+
+    ESP_LOGI(TAG, "set_bandwidth returned: %s", esp_err_to_name(err));
+
+    wifi_bandwidth_t actual_bw;
+    esp_wifi_get_bandwidth(WIFI_IF_STA, &actual_bw);
+    ESP_LOGI(TAG, "actual bandwidth is now: %d", actual_bw);
+
     esp_wifi_connect();
 }
 

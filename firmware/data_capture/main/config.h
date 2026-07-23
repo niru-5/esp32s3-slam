@@ -48,7 +48,7 @@
 // CONFIG_ENABLE_CAMERA=0 only gates the consumer paths -- camera_capture_task
 // (camera.c) keeps running at its already-low FPS regardless.
 // --------------------------------------------------------------------------
-#define CONFIG_ENABLE_IMU     0
+#define CONFIG_ENABLE_IMU     1
 #define CONFIG_ENABLE_CAMERA  1
 
 // --------------------------------------------------------------------------
@@ -59,11 +59,11 @@
 // --------------------------------------------------------------------------
 #define CONFIG_IMU_CAPTURE_PRIORITY   22
 #define CONFIG_IMU_CAPTURE_CORE       1
-#define CONFIG_IMU_CAPTURE_PERIOD_MS  1
+#define CONFIG_IMU_CAPTURE_PERIOD_MS  2
 
 #define CONFIG_IMU_QUEUE_LEN          1000   // ~200ms of samples at 1kHz
 
-#define CONFIG_IMU_CONSUMER_PRIORITY  6
+#define CONFIG_IMU_CONSUMER_PRIORITY  18
 #define CONFIG_IMU_CONSUMER_CORE      0
 #define CONFIG_IMU_CONSUMER_PERIOD_MS 500
 #define CONFIG_IMU_CONSUMER_BATCH     500   // samples drained per wake
@@ -73,17 +73,17 @@
 // task-notify) -> camera_queue (holds {fb pointer, ts_us}, not frame data) ->
 // camera_wifi_consumer_task / camera_sdcard_consumer_task.
 // --------------------------------------------------------------------------
-#define CONFIG_CAMERA_CAPTURE_PRIORITY 20
+#define CONFIG_CAMERA_CAPTURE_PRIORITY 10
 #define CONFIG_CAMERA_CAPTURE_CORE     1
 
 // Valid range 1-20 fps (i.e. capture period clamped 1000ms-50ms).
-#define CONFIG_CAMERA_CAPTURE_FPS      5
-#if CONFIG_CAMERA_CAPTURE_FPS < 1 || CONFIG_CAMERA_CAPTURE_FPS > 20
+#define CONFIG_CAMERA_CAPTURE_FPS      10
+#if CONFIG_CAMERA_CAPTURE_FPS < 1 || CONFIG_CAMERA_CAPTURE_FPS > 30
 #error "CONFIG_CAMERA_CAPTURE_FPS must be between 1 and 20"
 #endif
 #define CONFIG_CAMERA_CAPTURE_PERIOD_MS (1000 / CONFIG_CAMERA_CAPTURE_FPS)
 
-#define CONFIG_CAMERA_QUEUE_LEN         CONFIG_CAMERA_CAPTURE_FPS
+#define CONFIG_CAMERA_QUEUE_LEN      2   // CONFIG_CAMERA_CAPTURE_FPS
 
 // Frame buffers backing the camera driver (PSRAM). Every frame sitting in
 // camera_queue holds one buffer checked out, so fb_count must be >=
@@ -93,10 +93,10 @@
 // length rather than picked independently.
 #define CONFIG_CAMERA_FB_COUNT          CONFIG_CAMERA_QUEUE_LEN
 
-#define CONFIG_CAMERA_CONSUMER_PRIORITY  6
+#define CONFIG_CAMERA_CONSUMER_PRIORITY  17
 #define CONFIG_CAMERA_CONSUMER_CORE      0
-#define CONFIG_CAMERA_CONSUMER_PERIOD_MS 100
-
+#define CONFIG_CAMERA_CONSUMER_PERIOD_MS 10
+ 
 // --------------------------------------------------------------------------
 // Stats pipeline: stats_producer_task samples sysstats and pushes to
 // stats_queue; stats_writer_task drains it, branching on whichever sink
