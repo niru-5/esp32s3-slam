@@ -53,7 +53,7 @@ esp_err_t camera_init(void) {
         .ledc_timer   = LEDC_TIMER_0,
         .ledc_channel = LEDC_CHANNEL_0,
         .pixel_format = PIXFORMAT_JPEG,
-        .frame_size   = FRAMESIZE_VGA,
+        .frame_size   = FRAMESIZE_VGA, // FRAMESIZE_SVGA, // FRAMESIZE_VGA,
         .jpeg_quality = 12,
         .fb_count     = CONFIG_CAMERA_FB_COUNT,
         .fb_location  = CAMERA_FB_IN_PSRAM,

@@ -113,7 +113,13 @@ void app_main(void) {
     }
 
     if (camera_init() != ESP_OK) return;
+
+#if CONFIG_ENABLE_IMU
     if (imu_init() != ESP_OK) return;
+#else
+    ESP_LOGW(TAG, "IMU disabled (CONFIG_ENABLE_IMU=0) — skipping imu_init()");
+#endif
+
     sysstats_start();  // best-effort telemetry; failure is non-fatal
 
     bool sdcard_available = false;

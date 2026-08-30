@@ -90,6 +90,11 @@ static bool select_gravity_axis(imu_accel_foc_axis_t *out) {
 }
 
 static void imu_calibration_run(void) {
+#if !CONFIG_ENABLE_IMU
+    ESP_LOGW(TAG, "IMU calibration unavailable — IMU disabled (CONFIG_ENABLE_IMU=0) — ignoring command 4");
+    return;
+#endif
+
     ESP_LOGI(TAG, "=== IMU hardware FOC calibration ===");
 
     imu_accel_foc_axis_t gravity_axis;
