@@ -10,6 +10,61 @@
 // tasks read: task priorities, core pinning, periods, and queue depths.
 // --------------------------------------------------------------------------
 
+// --------------------------------------------------------------------------
+// Board selection — set exactly one of these to 1, the rest to 0. Selects
+// the camera's physical GPIO wiring below (CONFIG_CAM_*); other rig-specific
+// facts that can't be soft-toggled at runtime (e.g. sdkconfig's flash size)
+// still have to be set by hand to match whichever board is plugged in.
+//   BOARD_ESP32S3_MAIN   — main rig: custom OV5640 wiring, BMI270 IMU + SD card.
+//   BOARD_XIAO_ESP32S3   — Seeed XIAO ESP32-S3 Sense: onboard camera
+//                          connector, used for camera-only bring-up testing.
+// --------------------------------------------------------------------------
+#define BOARD_ESP32S3_MAIN   0
+#define BOARD_XIAO_ESP32S3   1
+
+#if (BOARD_ESP32S3_MAIN + BOARD_XIAO_ESP32S3) != 1
+#error "config.h: set exactly one BOARD_* to 1"
+#endif
+
+// Camera pins (OV5640) — physical wiring, one block per BOARD_* above.
+#if BOARD_ESP32S3_MAIN
+#define CONFIG_CAM_PWDN_GPIO  -1
+#define CONFIG_CAM_RESET_GPIO -1
+#define CONFIG_CAM_XCLK_GPIO  15
+#define CONFIG_CAM_SIOD_GPIO   4
+#define CONFIG_CAM_SIOC_GPIO   5
+#define CONFIG_CAM_Y9_GPIO    16
+#define CONFIG_CAM_Y8_GPIO    17
+#define CONFIG_CAM_Y7_GPIO    18
+#define CONFIG_CAM_Y6_GPIO    12
+#define CONFIG_CAM_Y5_GPIO    10
+#define CONFIG_CAM_Y4_GPIO     8
+#define CONFIG_CAM_Y3_GPIO     9
+#define CONFIG_CAM_Y2_GPIO    11
+#define CONFIG_CAM_VSYNC_GPIO  6
+#define CONFIG_CAM_HREF_GPIO   7
+#define CONFIG_CAM_PCLK_GPIO  13
+#elif BOARD_XIAO_ESP32S3
+// Seeed XIAO ESP32-S3 Sense onboard camera connector — fixed pinout, not a
+// wiring choice (matches Espressif/Arduino's CAMERA_MODEL_XIAO_ESP32S3).
+#define CONFIG_CAM_PWDN_GPIO  -1
+#define CONFIG_CAM_RESET_GPIO -1
+#define CONFIG_CAM_XCLK_GPIO  10
+#define CONFIG_CAM_SIOD_GPIO  40
+#define CONFIG_CAM_SIOC_GPIO  39
+#define CONFIG_CAM_Y9_GPIO    48
+#define CONFIG_CAM_Y8_GPIO    11
+#define CONFIG_CAM_Y7_GPIO    12
+#define CONFIG_CAM_Y6_GPIO    14
+#define CONFIG_CAM_Y5_GPIO    16
+#define CONFIG_CAM_Y4_GPIO    18
+#define CONFIG_CAM_Y3_GPIO    17
+#define CONFIG_CAM_Y2_GPIO    15
+#define CONFIG_CAM_VSYNC_GPIO 38
+#define CONFIG_CAM_HREF_GPIO  47
+#define CONFIG_CAM_PCLK_GPIO  13
+#endif
+
 // WiFi (STA mode)
 #define WIFI_SSID "Jarvis_slow"
 #define WIFI_PASS "Someoneisusingmydata"
@@ -84,7 +139,7 @@
 #define CONFIG_CAMERA_CAPTURE_CORE     1
 
 // Valid range 1-20 fps (i.e. capture period clamped 1000ms-50ms).
-#define CONFIG_CAMERA_CAPTURE_FPS      5
+#define CONFIG_CAMERA_CAPTURE_FPS      30
 #if CONFIG_CAMERA_CAPTURE_FPS < 1 || CONFIG_CAMERA_CAPTURE_FPS > 30
 #error "CONFIG_CAMERA_CAPTURE_FPS must be between 1 and 20"
 #endif
