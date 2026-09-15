@@ -139,7 +139,7 @@
 #define CONFIG_CAMERA_CAPTURE_CORE     1
 
 // Valid range 1-20 fps (i.e. capture period clamped 1000ms-50ms).
-#define CONFIG_CAMERA_CAPTURE_FPS      30
+#define CONFIG_CAMERA_CAPTURE_FPS      25
 #if CONFIG_CAMERA_CAPTURE_FPS < 1 || CONFIG_CAMERA_CAPTURE_FPS > 30
 #error "CONFIG_CAMERA_CAPTURE_FPS must be between 1 and 20"
 #endif
