@@ -158,6 +158,18 @@
 #define CONFIG_CAMERA_CONSUMER_PRIORITY  17
 #define CONFIG_CAMERA_CONSUMER_CORE      0
 #define CONFIG_CAMERA_CONSUMER_PERIOD_MS 10
+
+// Adaptive JPEG quality control (see docs/architecture.md "Adaptive JPEG
+// quality control"): camera_capture_task nudges sensor quality up/down each
+// frame based on camera_queue_depth()/overflow count, instead of a fixed
+// jpeg_quality. Quality is inverted -- lower number = higher quality/bigger
+// frame -- so MIN is the best-quality bound and MAX the most-compressed.
+#define CONFIG_CAMERA_JPEG_QUALITY_INITIAL       12
+#define CONFIG_CAMERA_JPEG_QUALITY_MIN            8
+#define CONFIG_CAMERA_JPEG_QUALITY_MAX           20
+#define CONFIG_CAMERA_JPEG_QUALITY_STEP           1
+#define CONFIG_CAMERA_JPEG_QUALITY_OVERFLOW_STEP  4
+#define CONFIG_CAMERA_JPEG_QUALITY_QUEUE_HIGH     3   // of CONFIG_CAMERA_QUEUE_LEN
  
 // --------------------------------------------------------------------------
 // Stats pipeline: stats_producer_task samples sysstats and pushes to

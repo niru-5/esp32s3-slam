@@ -175,6 +175,88 @@ buffer checked out, so a smaller `fb_count` would make `camera_grab()` block onc
 frames are in flight, well before the queue's own drop-oldest backpressure ever triggers,
 silently capping real throughput below the queue's depth.
 
+### Adaptive JPEG quality control (implemented)
+
+`camera_init()` used to fix `jpeg_quality = 12` for the life of the app. Scene
+complexity and WiFi/host conditions both swing JPEG frame size (and thus
+encode+send time) by 5x or more, so a fixed quality either wastes quality when
+the link has headroom, or overflows `camera_queue` — dropping whole frames —
+when it doesn't. This mirrors a technique from
+[hx-esp32-cam-fpv](https://github.com/RomanLut/hx-esp32-cam-fpv)'s
+`doc/adaptive_compression.md` (an ESP32 FPV project using the same
+ESP32-S3+OV5640 combination), adapted to this app's push/queue architecture.
+
+**Feedback signal**: `camera_queue_depth()` (0..`CONFIG_CAMERA_QUEUE_LEN`) is
+already computed and already reflects exactly the thing we care about — is
+`camera_wifi_consumer_task` keeping up with `camera_capture_task`? A growing
+queue means encode+send can't keep pace with capture at the current frame
+size; an empty queue means there's headroom to raise quality.
+`camera_queue_overflow_count()` (cumulative drops) is a secondary, harder
+signal: an overflow this cycle means the depth-based backoff wasn't fast
+enough, so react harder.
+
+**Where it runs**: inside `camera_capture_task`, once per captured frame,
+right after the frame is pushed onto `camera_queue` — no new task/timer. This
+reuses the existing `CONFIG_CAMERA_CAPTURE_FPS`-rate cadence (25/s) as the
+control loop's rate, frequent enough to track queue buildup without adding
+scheduling overhead.
+
+**Algorithm** — 3-zone hysteresis on `camera_queue_depth()`, plus an overflow
+fast-path (JPEG quality is inverted: lower number = higher quality/larger
+frame):
+
+| Condition (checked in this order) | Action |
+|---|---|
+| an overflow happened this cycle (`camera_queue_overflow_count()` increased) | quality += `CONFIG_CAMERA_JPEG_QUALITY_OVERFLOW_STEP` (clamped to MAX) |
+| `camera_queue_depth() >= CONFIG_CAMERA_JPEG_QUALITY_QUEUE_HIGH` | quality += `CONFIG_CAMERA_JPEG_QUALITY_STEP` (clamped to MAX) |
+| `camera_queue_depth() == 0` | quality -= `CONFIG_CAMERA_JPEG_QUALITY_STEP` (clamped to MIN) |
+| depth in between (dead-band) | hold steady |
+
+Only calls `sensor->set_quality()` (an SCCB/I2C write) when the value actually
+changes, not every frame. The quality persists across frames within one
+`STREAM_WIFI`/`STREAM_SDCARD` session; `camera_pipeline_start()` resets it to
+`CONFIG_CAMERA_JPEG_QUALITY_INITIAL` (and writes that back to the sensor) on
+every entry, consistent with the "nothing carries over across a state
+transition" rule already in place for the queues/overflow counters.
+
+**New `config.h` knobs**:
+- `CONFIG_CAMERA_JPEG_QUALITY_INITIAL` (12, today's old fixed value) —
+  starting point each session.
+- `CONFIG_CAMERA_JPEG_QUALITY_MIN` (8) / `CONFIG_CAMERA_JPEG_QUALITY_MAX` (40)
+  — clamp range. 8 mirrors hx-esp32-cam-fpv's floor (lower values are
+  reported to produce broken frames on some OV sensors); 40 is a
+  conservative compression ceiling well short of the driver's own 63 max, so
+  a saturated link degrades to a small-but-recognizable JPEG rather than a
+  mostly-noise image.
+- `CONFIG_CAMERA_JPEG_QUALITY_STEP` (1) — gradual per-frame adjustment size.
+- `CONFIG_CAMERA_JPEG_QUALITY_OVERFLOW_STEP` (4) — larger jump on a confirmed
+  drop.
+- `CONFIG_CAMERA_JPEG_QUALITY_QUEUE_HIGH` (3, of `CONFIG_CAMERA_QUEUE_LEN` =
+  5) — depth at which to start compressing harder, before the queue actually
+  overflows.
+
+**Deliberately out of scope**: this only asks the sensor to compress harder
+or softer — it does not touch frame size/resolution, FPS, or the wire format
+(the `/frame` payload is still an opaque JPEG blob + timestamp, so
+`software/host_server` needs no changes). Exposing the live quality value
+through `sysstats_snapshot_t` for observability is a natural follow-up but
+isn't done here, to keep this pass free of wire-format changes (see the
+`wire.py` lockstep note above).
+
+**Why not FEC / a target-bitrate-from-link-bandwidth model**
+(hx-esp32-cam-fpv's fuller approach): that project derives a target frame
+size from raw-802.11 link bitrate ÷ FEC overhead ÷ FPS, because it has no
+transport-level backpressure (packet injection, no TCP, no ACKs — a lost
+packet is gone forever unless FEC reconstructs it). Here, `camera_queue_depth()`
+sitting on top of a TCP/HTTP push already *is* that backpressure signal — it
+rises precisely when the network can't keep up, for whatever reason (link,
+host, congestion), without needing to model bandwidth explicitly. FEC itself
+wasn't ported: TCP already retransmits and orders reliably, so spending
+bandwidth/CPU on Reed-Solomon redundancy on top would protect against a loss
+class this transport doesn't have.
+
+---
+
 ### IMU pipeline data flow
 
 ```

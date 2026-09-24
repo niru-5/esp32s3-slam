@@ -15,6 +15,9 @@ static esp_timer_handle_t s_capture_timer       = NULL;
 static TaskHandle_t       s_capture_task_handle = NULL;
 static uint32_t           s_overflow_count       = 0;
 
+static int                s_current_jpeg_quality = CONFIG_CAMERA_JPEG_QUALITY_INITIAL;
+static uint32_t           s_quality_last_overflow_count = 0;
+
 esp_err_t camera_init(void) {
     camera_config_t cam_cfg = {
         .pin_pwdn     = CONFIG_CAM_PWDN_GPIO,
@@ -33,8 +36,8 @@ esp_err_t camera_init(void) {
         .ledc_timer   = LEDC_TIMER_0,
         .ledc_channel = LEDC_CHANNEL_0,
         .pixel_format = PIXFORMAT_JPEG,
-        .frame_size   = FRAMESIZE_SVGA, //FRAMESIZE_HD, // FRAMESIZE_SVGA, // FRAMESIZE_VGA, FRAMESIZE_SXGA
-        .jpeg_quality = 12,
+        .frame_size   = FRAMESIZE_SVGA, // FRAMESIZE_SVGA, //FRAMESIZE_HD, // FRAMESIZE_SVGA, // FRAMESIZE_VGA, FRAMESIZE_SXGA
+        .jpeg_quality = CONFIG_CAMERA_JPEG_QUALITY_INITIAL,
         .fb_count     = CONFIG_CAMERA_FB_COUNT,
         .fb_location  = CAMERA_FB_IN_PSRAM,
         .grab_mode    = CAMERA_GRAB_WHEN_EMPTY,
@@ -62,6 +65,35 @@ static void capture_timer_cb(void *arg) {
     xTaskNotifyGive(s_capture_task_handle);
 }
 
+// 3-zone hysteresis on camera_queue_depth(), plus an overflow fast-path (see
+// docs/architecture.md "Adaptive JPEG quality control"). Only touches the
+// sensor -- an SCCB/I2C write -- when the target quality actually changes.
+static void adjust_jpeg_quality(uint32_t queue_depth_after_enqueue) {
+    uint32_t overflow_now = s_overflow_count;
+    bool overflowed = overflow_now != s_quality_last_overflow_count;
+    s_quality_last_overflow_count = overflow_now;
+
+    int quality = s_current_jpeg_quality;
+    if (overflowed) {
+        quality += CONFIG_CAMERA_JPEG_QUALITY_OVERFLOW_STEP;
+    } else if (queue_depth_after_enqueue >= CONFIG_CAMERA_JPEG_QUALITY_QUEUE_HIGH) {
+        quality += CONFIG_CAMERA_JPEG_QUALITY_STEP;
+    } else if (queue_depth_after_enqueue == 0) {
+        quality -= CONFIG_CAMERA_JPEG_QUALITY_STEP;
+    }
+
+    if (quality < CONFIG_CAMERA_JPEG_QUALITY_MIN) quality = CONFIG_CAMERA_JPEG_QUALITY_MIN;
+    if (quality > CONFIG_CAMERA_JPEG_QUALITY_MAX) quality = CONFIG_CAMERA_JPEG_QUALITY_MAX;
+
+    if (quality != s_current_jpeg_quality) {
+        sensor_t *sensor = esp_camera_sensor_get();
+        if (sensor) sensor->set_quality(sensor, quality);
+        s_current_jpeg_quality = quality;
+        ESP_LOGI(TAG, "jpeg quality -> %d (queue depth %lu%s)", quality,
+                 (unsigned long)queue_depth_after_enqueue, overflowed ? ", overflow" : "");
+    }
+}
+
 static void camera_capture_task(void *arg) {
     while (1) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -82,6 +114,8 @@ static void camera_capture_task(void *arg) {
             ESP_LOGW(TAG, "camera_queue full, dropped oldest frame (overflow #%lu)",
                      (unsigned long)s_overflow_count);
         }
+
+        adjust_jpeg_quality(camera_queue_depth());
     }
 }
 
@@ -91,6 +125,14 @@ static void camera_capture_task(void *arg) {
 
 esp_err_t camera_pipeline_start(void) {
     s_overflow_count = 0;
+
+    // Reset adaptive quality state fresh each session, mirroring the queues/
+    // overflow counters -- nothing carries over across a state transition.
+    s_current_jpeg_quality = CONFIG_CAMERA_JPEG_QUALITY_INITIAL;
+    s_quality_last_overflow_count = 0;
+    sensor_t *sensor = esp_camera_sensor_get();
+    if (sensor) sensor->set_quality(sensor, s_current_jpeg_quality);
+
     s_camera_queue = xQueueCreate(CONFIG_CAMERA_QUEUE_LEN, sizeof(camera_frame_t));
     if (!s_camera_queue) return ESP_ERR_NO_MEM;
 
