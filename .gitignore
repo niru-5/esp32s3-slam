@@ -224,3 +224,6 @@ __marimo__/
 esp-idf/
 managed_components/
 hx-esp32-cam-fpv/
+
+# calibration/tuning sessions (host_server.calibration)
+software/calib_data/

@@ -30,8 +30,11 @@ static net_conn_t s_frame_conn = {0};
 static net_conn_t s_imu_conn   = {0};
 static net_conn_t s_stats_conn = {0};
 
-static TaskHandle_t s_imu_consumer_handle    = NULL;
-static TaskHandle_t s_camera_consumer_handle = NULL;
+// Cooperative shutdown: consumer tasks are never vTaskDelete()d from outside (a task killed while
+// blocked inside lwIP/esp_http_client leaves lwIP signalling a dead task's semaphore -> panic in
+// lwIP's timer thread). Every perform() is bounded by timeout_ms, so they notice s_stop promptly.
+static volatile bool s_stop  = false;
+static volatile int  s_alive = 0;
 
 // POST a body to http://CONFIG_REMOTE_HOST:CONFIG_REMOTE_PORT<path>, reusing
 // `conn`'s connection across calls. `ts_us` (>=0) is sent as the
@@ -97,13 +100,15 @@ static void imu_wifi_consumer_task(void *arg) {
     if (!samples || !wire) {
         ESP_LOGE(TAG, "out of memory for IMU consumer buffers");
         free(samples); free(wire);
+        s_alive--;
         vTaskDelete(NULL);
         return;
     }
 
     TickType_t last_wake = xTaskGetTickCount();
-    while (1) {
+    while (!s_stop) {
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(CONFIG_IMU_CONSUMER_PERIOD_MS));
+        if (s_stop) break;
 
         int64_t  ref_esp_us;
         uint32_t ref_ticks;
@@ -118,6 +123,10 @@ static void imu_wifi_consumer_task(void *arg) {
         post_bytes(&s_imu_conn, "/imu", "application/octet-stream", wire, wire_len, -1);
         DEBUG_TIME_END(t_send, TAG, "imu sending");
     }
+    free(samples);
+    free(wire);
+    s_alive--;
+    vTaskDelete(NULL);
 }
 #endif // CONFIG_ENABLE_IMU
 
@@ -131,23 +140,29 @@ static void camera_wifi_consumer_task(void *arg) {
     camera_frame_t *frames = malloc(CONFIG_CAMERA_QUEUE_LEN * sizeof(camera_frame_t));
     if (!frames) {
         ESP_LOGE(TAG, "out of memory for camera consumer buffer");
+        s_alive--;
         vTaskDelete(NULL);
         return;
     }
 
     TickType_t last_wake = xTaskGetTickCount();
-    while (1) {
+    while (!s_stop) {
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(CONFIG_CAMERA_CONSUMER_PERIOD_MS));
 
         uint32_t n = camera_queue_drain(frames, CONFIG_CAMERA_QUEUE_LEN);
         for (uint32_t i = 0; i < n; i++) {
-            DEBUG_TIME_START(t_send);
-            post_bytes(&s_frame_conn, "/frame", "image/jpeg",
-                      frames[i].fb->buf, frames[i].fb->len, frames[i].ts_us);
-            DEBUG_TIME_END(t_send, TAG, "camera sending");
-            camera_release(frames[i].fb);
+            if (!s_stop) {
+                DEBUG_TIME_START(t_send);
+                post_bytes(&s_frame_conn, "/frame", "image/jpeg",
+                          frames[i].fb->buf, frames[i].fb->len, frames[i].ts_us);
+                DEBUG_TIME_END(t_send, TAG, "camera sending");
+            }
+            camera_release(frames[i].fb);   // always -- also for frames drained but not sent on stop
         }
     }
+    free(frames);
+    s_alive--;
+    vTaskDelete(NULL);
 }
 #endif // CONFIG_ENABLE_CAMERA
 
@@ -156,21 +171,27 @@ static void camera_wifi_consumer_task(void *arg) {
 // --------------------------------------------------------------------------
 
 esp_err_t net_client_pipeline_start(void) {
+    s_stop = false;
+    s_alive = 0;
 #if CONFIG_ENABLE_IMU
+    s_alive++;
     if (xTaskCreatePinnedToCore(imu_wifi_consumer_task, "imu_wifi", 8192, NULL,
-                                CONFIG_IMU_CONSUMER_PRIORITY, &s_imu_consumer_handle,
-                                CONFIG_IMU_CONSUMER_CORE) != pdPASS)
+                                CONFIG_IMU_CONSUMER_PRIORITY, NULL,
+                                CONFIG_IMU_CONSUMER_CORE) != pdPASS) {
+        s_alive--;
         return ESP_ERR_NO_MEM;
+    }
 #else
     ESP_LOGW(TAG, "IMU wifi streaming disabled (CONFIG_ENABLE_IMU=0)");
 #endif
 
 #if CONFIG_ENABLE_CAMERA
+    s_alive++;
     if (xTaskCreatePinnedToCore(camera_wifi_consumer_task, "cam_wifi", 8192, NULL,
-                                CONFIG_CAMERA_CONSUMER_PRIORITY, &s_camera_consumer_handle,
+                                CONFIG_CAMERA_CONSUMER_PRIORITY, NULL,
                                 CONFIG_CAMERA_CONSUMER_CORE) != pdPASS) {
-        vTaskDelete(s_imu_consumer_handle);
-        s_imu_consumer_handle = NULL;
+        s_alive--;
+        net_client_pipeline_stop();
         return ESP_ERR_NO_MEM;
     }
 #else
@@ -182,14 +203,23 @@ esp_err_t net_client_pipeline_start(void) {
     return ESP_OK;
 }
 
+void net_client_pipeline_request_stop(void) {
+    s_stop = true;
+}
+
 void net_client_pipeline_stop(void) {
-    if (s_imu_consumer_handle)    { vTaskDelete(s_imu_consumer_handle);    s_imu_consumer_handle    = NULL; }
-    if (s_camera_consumer_handle) { vTaskDelete(s_camera_consumer_handle); s_camera_consumer_handle = NULL; }
+    s_stop = true;
+    for (int i = 0; i < 500 && s_alive > 0; i++) vTaskDelay(pdMS_TO_TICKS(20));
+    if (s_alive > 0) {
+        ESP_LOGE(TAG, "%d wifi consumer task(s) still busy after 10 s; leaving them to finish", (int)s_alive);
+        return;
+    }
     close_conn(&s_frame_conn);
     close_conn(&s_imu_conn);
     close_conn(&s_stats_conn);
 }
 
 esp_err_t net_client_send_stats(const uint8_t *payload, size_t len) {
+    if (s_stop) return ESP_FAIL;
     return post_bytes(&s_stats_conn, "/stats", "application/octet-stream", payload, len, -1);
 }

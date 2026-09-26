@@ -178,3 +178,18 @@ so the two streams remain mutually synchronised in the bag.
 | `ModuleNotFoundError: No module named 'rosbag2_storage_mcap'` with `--storage mcap` | mcap storage plugin not installed | `sudo apt install ros-jazzy-rosbag2-storage-mcap`, or drop back to the default `--storage sqlite3`. |
 | Bag directory already exists / writer fails to open | A previous run used the same `--bag` path (or ran twice in the same second with the default timestamp) | Pick a different `--bag <path>`, or delete/move the old bag directory first. |
 | Server runs but bags land somewhere unexpected | `--bag`'s default (`bags/slam_<timestamp>`) is relative to the **current working directory**, not this file's location | Run `python3 -m host_server` from `software/`, as shown above, or pass an absolute `--bag` path. |
+
+
+## Camera calibration / ISP tuning
+
+`host_server/calibration/` (separate from the streaming server; needs numpy + OpenCV — `pip install -r requirements-calib.txt`,
+a venv at `software/.venv` is used in this repo) is the host side of the device's `CAMERA_CALIBRATION` mode:
+
+```bash
+.venv/bin/python -m host_server.calibration run --serial /dev/ttyACM0     # checkerboard capture + tuning steps
+.venv/bin/python -m host_server.calibration solve calib_data/<session>    # re-solve intrinsics offline
+.venv/bin/python -m host_server.calibration make-board board.png           # printable checkerboard
+.venv/bin/python -m unittest tests.test_calibration -v                    # tests (simulated device)
+```
+
+See [`docs/camera_calibration_and_tuning.md`](../docs/camera_calibration_and_tuning.md).

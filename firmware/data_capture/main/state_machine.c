@@ -16,6 +16,7 @@
 #include "net_client.h"
 #include "tcp_client.h"
 #include "sdcard.h"
+#include "cam_calib.h"
 
 static const char *TAG = "STATE";
 
@@ -35,7 +36,7 @@ static bool        s_sdcard_available  = false;
 // running promptly while it waits.
 //
 // Noise-density/random-walk/Allan-variance work is not implemented -- see
-// docs/calibration.md. Camera calibration is still a provisioning stub.
+// docs/calibration.md. Camera calibration lives in cam_calib.c.
 // --------------------------------------------------------------------------
 
 // Block until the operator sends one non-blank byte, reusing the same
@@ -155,10 +156,6 @@ static void imu_calibration_run(void) {
     }
 }
 
-static void camera_calibration_run(void) {
-    ESP_LOGW(TAG, "camera calibration not implemented yet");
-}
-
 // --------------------------------------------------------------------------
 // Transitions — every streaming pipeline is created fresh on entry and
 // deleted (queues flushed, not suspended) on exit, per docs/architecture.md
@@ -168,8 +165,9 @@ static void camera_calibration_run(void) {
 static void teardown_active_pipelines(void) {
     switch (s_state) {
     case APP_STATE_STREAM_WIFI:
+        net_client_pipeline_request_stop();   // abort in-flight sends so the stats writer stops quickly ...
+        sysstats_pipeline_stop();             // ... then it, before the sink: it sends on the sink's connection
         net_client_pipeline_stop();
-        sysstats_pipeline_stop();
         camera_pipeline_stop();
         imu_pipeline_stop();
         break;
@@ -180,10 +178,14 @@ static void teardown_active_pipelines(void) {
         imu_pipeline_stop();
         break;
     case APP_STATE_STREAM_TCP:
+        tcp_client_pipeline_request_stop();   // abort in-flight sends so the stats writer stops quickly ...
+        sysstats_pipeline_stop();             // ... then it, before the sink: it sends on the sink's connection
         tcp_client_pipeline_stop();
-        sysstats_pipeline_stop();
         camera_pipeline_stop();
         imu_pipeline_stop();
+        break;
+    case APP_STATE_CAMERA_CALIBRATION:
+        cam_calib_stop();
         break;
     default:
         break;
@@ -199,8 +201,8 @@ static void enter_stream_wifi(void) {
         net_client_pipeline_start() != ESP_OK ||
         sysstats_pipeline_start(SYSSTATS_SINK_WIFI) != ESP_OK) {
         ESP_LOGE(TAG, "failed to start wifi streaming pipeline — rolling back");
-        net_client_pipeline_stop();
         sysstats_pipeline_stop();
+        net_client_pipeline_stop();
         camera_pipeline_stop();
         imu_pipeline_stop();
         return;
@@ -241,8 +243,8 @@ static void enter_stream_tcp(void) {
         tcp_client_pipeline_start() != ESP_OK ||
         sysstats_pipeline_start(SYSSTATS_SINK_TCP) != ESP_OK) {
         ESP_LOGE(TAG, "failed to start tcp streaming pipeline — rolling back");
-        tcp_client_pipeline_stop();
         sysstats_pipeline_stop();
+        tcp_client_pipeline_stop();
         camera_pipeline_stop();
         imu_pipeline_stop();
         return;
@@ -257,14 +259,28 @@ static void enter_idle(void) {
     ESP_LOGI(TAG, "-> IDLE");
 }
 
-static void enter_calibration(app_state_t which) {
+static void enter_imu_calibration(void) {
     teardown_active_pipelines();
-    s_state = which;
-    if (which == APP_STATE_IMU_CALIBRATION) imu_calibration_run();
-    else                                    camera_calibration_run();
-    // Stub runs synchronously and returns immediately -- nothing to stay
-    // "in progress" for yet, so drop straight back to idle.
+    s_state = APP_STATE_IMU_CALIBRATION;
+    imu_calibration_run();
+    // Runs synchronously and returns when done -- nothing to stay "in
+    // progress" for, so drop straight back to idle.
     s_state = APP_STATE_IDLE;
+}
+
+// Camera calibration/tuning is host-driven and long-lived: cam_calib_task owns
+// the camera and the control socket until the host sends "exit" (or serial 3).
+// We stay in APP_STATE_CAMERA_CALIBRATION meanwhile; the poll loop below drops
+// back to IDLE once the task has finished.
+static void enter_camera_calibration(void) {
+    teardown_active_pipelines();
+    s_state = APP_STATE_IDLE;
+    if (cam_calib_start() != ESP_OK) {
+        ESP_LOGE(TAG, "failed to start camera calibration");
+        return;
+    }
+    s_state = APP_STATE_CAMERA_CALIBRATION;
+    ESP_LOGI(TAG, "-> CAMERA_CALIBRATION");
 }
 
 static void handle_command(char c) {
@@ -272,8 +288,8 @@ static void handle_command(char c) {
     case '1': enter_stream_wifi();                              break;
     case '2': enter_stream_sdcard();                             break;
     case '3': enter_idle();                                      break;
-    case '4': enter_calibration(APP_STATE_IMU_CALIBRATION);       break;
-    case '5': enter_calibration(APP_STATE_CAMERA_CALIBRATION);    break;
+    case '4': enter_imu_calibration();                            break;
+    case '5': enter_camera_calibration();                        break;
     case '6': enter_stream_tcp();                                 break;
     default: break;  // ignore newlines / anything else
     }
@@ -306,6 +322,10 @@ static void main_state_machine_task(void *arg) {
         int c;
         while ((c = fgetc(stdin)) != EOF)
             handle_command((char)c);
+        if (s_state == APP_STATE_CAMERA_CALIBRATION && !cam_calib_active()) {
+            s_state = APP_STATE_IDLE;
+            ESP_LOGI(TAG, "camera calibration finished -> IDLE");
+        }
     }
 }
 

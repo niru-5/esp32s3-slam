@@ -18,7 +18,20 @@ static uint32_t           s_overflow_count       = 0;
 static int                s_current_jpeg_quality = CONFIG_CAMERA_JPEG_QUALITY_INITIAL;
 static uint32_t           s_quality_last_overflow_count = 0;
 
-esp_err_t camera_init(void) {
+static bool s_camera_up = false;
+
+esp_err_t camera_init_ex(pixformat_t fmt, framesize_t size, int jpeg_quality,
+                         int fb_count, bool raw8, bool grab_latest) {
+    if (s_camera_up) {
+        esp_camera_deinit();
+        s_camera_up = false;
+    }
+    // RAW8: the ESP32-S3 DVP driver has no PIXFORMAT_RAW path (ll_cam.c rejects
+    // it), so bring the sensor up as GRAYSCALE -- 1 byte/pixel, no conversion --
+    // and afterwards flip the OV5640 ISP to its RAW (Bayer) output. The DMA path
+    // can't tell the difference: it just copies width*height bytes.
+    pixformat_t driver_fmt = raw8 ? PIXFORMAT_GRAYSCALE : fmt;
+
     camera_config_t cam_cfg = {
         .pin_pwdn     = CONFIG_CAM_PWDN_GPIO,
         .pin_reset    = CONFIG_CAM_RESET_GPIO,
@@ -35,20 +48,37 @@ esp_err_t camera_init(void) {
         .xclk_freq_hz = 20000000,
         .ledc_timer   = LEDC_TIMER_0,
         .ledc_channel = LEDC_CHANNEL_0,
-        .pixel_format = PIXFORMAT_JPEG,
-        .frame_size   = FRAMESIZE_SVGA, // FRAMESIZE_SVGA, //FRAMESIZE_HD, // FRAMESIZE_SVGA, // FRAMESIZE_VGA, FRAMESIZE_SXGA
-        .jpeg_quality = CONFIG_CAMERA_JPEG_QUALITY_INITIAL,
-        .fb_count     = CONFIG_CAMERA_FB_COUNT,
+        .pixel_format = driver_fmt,
+        .frame_size   = size,
+        .jpeg_quality = jpeg_quality,
+        .fb_count     = fb_count,
         .fb_location  = CAMERA_FB_IN_PSRAM,
-        .grab_mode    = CAMERA_GRAB_WHEN_EMPTY,
+        .grab_mode    = grab_latest ? CAMERA_GRAB_LATEST : CAMERA_GRAB_WHEN_EMPTY,
     };
     esp_err_t err = esp_camera_init(&cam_cfg);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Camera init failed");
+        ESP_LOGE(TAG, "Camera init failed (%s)", esp_err_to_name(err));
         return err;
     }
-    ESP_LOGI(TAG, "Camera ready — JPEG VGA, %d PSRAM frame buffers", CONFIG_CAMERA_FB_COUNT);
+    s_camera_up = true;
+
+    if (raw8) {
+        sensor_t *sensor = esp_camera_sensor_get();
+        // Same two writes as esp32-camera's own sensor_fmt_raw table
+        // (0x501F ISP format = RAW, 0x4300 format control = RAW).
+        if (sensor) {
+            sensor->set_reg(sensor, 0x501F, 0xFF, 0x03);
+            sensor->set_reg(sensor, 0x4300, 0xFF, 0x00);
+        }
+    }
+    ESP_LOGI(TAG, "Camera ready — fmt=%d%s size=%d, %d PSRAM frame buffers",
+             (int)fmt, raw8 ? "(raw8)" : "", (int)size, fb_count);
     return ESP_OK;
+}
+
+esp_err_t camera_init(void) {
+    return camera_init_ex(PIXFORMAT_JPEG, FRAMESIZE_SVGA, CONFIG_CAMERA_JPEG_QUALITY_INITIAL,
+                          CONFIG_CAMERA_FB_COUNT, false, false);
 }
 
 void camera_release(camera_fb_t *fb) {

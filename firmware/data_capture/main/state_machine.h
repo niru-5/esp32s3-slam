@@ -11,7 +11,10 @@
 //   2 -> STREAM_SDCARD       start camera+IMU capture, log to the SD card
 //   3 -> IDLE                stop streaming (any sink)
 //   4 -> IMU_CALIBRATION     provisioning stub, see state_machine.c
-//   5 -> CAMERA_CALIBRATION  provisioning stub, see state_machine.c
+//   5 -> CAMERA_CALIBRATION  host-driven camera calibration / ISP tuning session:
+//                            the device dials software/host_server/calibration on
+//                            the host (see cam_calib.h, docs/camera_calibration_and_tuning.md).
+//                            Stays in this state until the host sends "exit" or serial 3.
 //   6 -> STREAM_TCP          start camera+IMU capture, stream to the host over
 //                            a raw TCP socket (see tcp_client.h) instead of
 //                            HTTP -- lower per-message overhead, same capture

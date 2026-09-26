@@ -446,6 +446,38 @@ congestion, and a strong RSSI does not mean zero loss.
 
 ---
 
+## 14. Stopping a streaming mode crashed the board (lwIP panic) — never `vTaskDelete` a task blocked in a socket call
+
+**Symptom.** Sending `3` (stop) after `6` (STREAM_TCP) or `1` (STREAM_WIFI) sometimes rebooted the board a few seconds
+later, always when the host was unreachable (firewall dropping the SYN, host tool not running):
+`Guru Meditation Error: Core 0 panic'ed (LoadProhibited)` or `Interrupt wdt timeout on CPU0`, or
+`assert failed: xQueueGenericSend queue.c`. Backtrace (decoded with `xtensa-esp32s3-elf-addr2line`):
+`tcpip_thread → sys_check_timeouts → tcp_slowtmr → err_tcp → sys_sem_signal → xQueueGenericSend`.
+
+**Cause.** `net_client_pipeline_stop()`, `tcp_client_pipeline_stop()` and `sysstats_pipeline_stop()` killed their
+consumer tasks with `vTaskDelete()`. With an unreachable host those tasks are routinely blocked inside lwIP
+(`connect()` retrying its SYN, `send()`, `esp_http_client_perform()`). lwIP keeps a semaphore tied to the blocked call;
+when its own timer later fires (`err_tcp`) it signals a semaphore that belonged to the now-deleted task → crash in
+lwIP's thread, seconds after the stop, which is why it looked random. (Deleting mid-send also leaked the frame buffer
+the task was holding.)
+
+**Fix.** Cooperative shutdown, same pattern in all three modules: a `volatile bool` stop flag, tasks loop
+`while (!stop)` and exit themselves (`vTaskDelete(NULL)` after freeing buffers and releasing any drained frame),
+and `*_pipeline_stop()` sets the flag and *waits* for them (an alive-counter) before closing sockets. Every blocking call
+is bounded and stop-aware: `connect()` is non-blocking, polled in 200 ms `select()` slices (3 s overall); `send()` has
+`SO_SNDTIMEO` 2 s and checks the flag between chunks; `esp_http_client` has `timeout_ms` 2000. Ordering matters too:
+the stats writer sends on the sink's connection, so teardown is `*_request_stop()` (raise the flag, no wait) →
+`sysstats_pipeline_stop()` → `*_pipeline_stop()` (wait + close). If a task is somehow still busy after the timeout the
+code logs an error and leaves it alone — it never deletes it.
+
+**Verified on hardware:** 4× (`6`,`3`,`1`,`3`) cycles plus direct `6`↔`1` switches with nothing listening on the host,
+followed by a 20 s soak: 0 panics, stop takes 0.5–0.7 s. With `host_server` running both modes stream ≈22 fps and stop cleanly.
+
+**Rule of thumb.** In ESP-IDF never `vTaskDelete()` a task that may be inside lwIP / esp_http_client / any blocking
+socket call; signal it and let it return.
+
+---
+
 ## TL;DR checklist: data_capture streaming is slow / SD card won't mount
 1. Network POST taking 100s of ms and it's not obviously the WiFi signal (check RSSI via
    `/stats`)? → try `WIFI_PS_NONE` first, but don't stop there.
