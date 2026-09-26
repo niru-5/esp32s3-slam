@@ -89,3 +89,11 @@ Not started. `firmware/camera_calibration/` currently holds only target PDFs
 `state_machine.c` remains a stub. Plan is to use existing tooling (Kalibr or
 ROS `camera_calibration`) against captured frames rather than implementing
 calibration logic on-device.
+
+
+## Camera calibration and ISP tuning (implemented)
+
+Checkerboard intrinsics (burst/auto capture with on-the-fly solve, offline re-solve) and the ten
+OV5640 tuning steps from the playbook are driven from the host with
+`python -m host_server.calibration run` while the device is in `CAMERA_CALIBRATION` (console
+command `5`). See [camera_calibration_and_tuning.md](camera_calibration_and_tuning.md).

@@ -85,6 +85,10 @@
 #define CONFIG_REMOTE_TCP_IMU_PORT   8082
 #define CONFIG_REMOTE_TCP_STATS_PORT 8083
 
+// CAMERA_CALIBRATION mode (cam_calib.c): the device dials CONFIG_REMOTE_HOST on this port and
+// takes commands from the host tool (software/host_server/calibration) over that connection.
+#define CONFIG_CAM_CALIB_PORT 8084
+
 // --------------------------------------------------------------------------
 // main_state_machine_task — owns the IDLE/STREAM_WIFI/STREAM_SDCARD/
 // CALIBRATION state and creates/deletes the pipelines below on transition.

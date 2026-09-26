@@ -10,6 +10,7 @@ idf_component_register(
         "tcp_client.c"
         "sdcard.c"
         "state_machine.c"
+        "cam_calib.c"
         "${BMI_API}/bmi2.c"
         "${BMI_API}/bmi270.c"
     INCLUDE_DIRS

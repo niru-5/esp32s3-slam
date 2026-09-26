@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "esp_err.h"
 #include "esp_camera.h"
 
@@ -32,6 +33,16 @@ typedef struct {
 // Initialize the camera hardware only. Returns ESP_OK when ready for
 // camera_pipeline_start().
 esp_err_t camera_init(void);
+
+// Re-initialize the camera in an arbitrary mode (deinit first if already up).
+// Used by camera calibration/tuning mode (cam_calib.c). Resets every sensor
+// register to the driver's defaults for the new mode. `raw8` selects 8-bit Bayer
+// output (ISP bypass; `fmt` is ignored) -- see camera.c for how. `grab_latest`
+// makes esp_camera_fb_get() return the newest frame instead of the oldest queued
+// one (what a tuning loop wants after a register write).
+// Must not be called while camera_pipeline_start() is active.
+esp_err_t camera_init_ex(pixformat_t fmt, framesize_t size, int jpeg_quality,
+                         int fb_count, bool raw8, bool grab_latest);
 
 // Create camera_queue (CONFIG_CAMERA_QUEUE_LEN deep) and camera_capture_task
 // (prio CONFIG_CAMERA_CAPTURE_PRIORITY, core CONFIG_CAMERA_CAPTURE_CORE),

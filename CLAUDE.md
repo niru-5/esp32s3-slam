@@ -15,6 +15,7 @@ The project is currently at the firmware bring-up stage: two standalone ESP-IDF 
 
 - `firmware/data_capture/` — main app: OV5640 camera + BMI270 IMU + WiFi + HTTP server, streams both to a host over the network.
 - `firmware/imu_testing/` — standalone BMI270 bring-up app (I2C bus scan + raw sample printout). Use this when debugging IMU wiring/config in isolation from the camera/WiFi stack.
+- `firmware/data_capture/main/cam_calib.c` — `CAMERA_CALIBRATION` mode (console command `5`): device-side of the host-driven camera calibration / ISP tuning workflow. Host side is `software/host_server/calibration/` (needs numpy+OpenCV: `software/.venv`, `requirements-calib.txt`; tests in `software/tests/`). See `docs/camera_calibration_and_tuning.md`.
 - `firmware/camera_calibration/` — calibration target PDFs (ChArUco/circles/Kalibr boards), no code.
 - `firmware/esp-idf/` — full ESP-IDF SDK checkout (v5.3.5, target esp32s3). Gitignored — treat as a local toolchain install, not project source.
 - `SparkFun_BMI270_Arduino_Library/` — vendored BMI270 driver. Only `src/bmi270_api/bmi2.c` and `bmi270.c` are used; both firmware apps compile these two files directly into their `main` component (see each `main/CMakeLists.txt`) rather than consuming it as an ESP-IDF component or Arduino library.

@@ -72,7 +72,7 @@ instead of) serial.
 | `2` | `STREAM_SDCARD` | start camera+IMU capture, log to the SD card |
 | `3` | `IDLE` | stop streaming (any sink) — tear everything down |
 | `4` | `IMU_CALIBRATION` | run IMU calibration routine (provisioned only, see below) |
-| `5` | `CAMERA_CALIBRATION` | run camera calibration routine (provisioned only, see below) |
+| `5` | `CAMERA_CALIBRATION` | host-driven camera calibration / ISP tuning session (`cam_calib.c`, see [camera_calibration_and_tuning.md](camera_calibration_and_tuning.md)); stays in this state until the host sends `exit` or serial `3` |
 | `6` | `STREAM_TCP` | start camera+IMU capture, stream to the host over three dedicated raw TCP sockets (`tcp_client.c`, one per stream) instead of HTTP |
 
 ### Transition rules
