@@ -9,12 +9,13 @@ Firmware + tooling for an ESP32-S3-based visual-inertial SLAM rig (see `TODO.md`
 1. **Goal 1** — capture camera frames and IMU samples with reliable timestamps, calibrate camera/IMU, record to a ROS bag, run SLAM offline with ROS tooling.
 2. **Goal 2** — eventually run a sparse/fast SLAM pipeline on the ESP32-S3 itself.
 
-The project is currently at the firmware bring-up stage: two standalone ESP-IDF apps under `firmware/`. `hardware/` and `software/` are empty placeholders for future PCB/host-side work.
+The project is currently at the firmware bring-up stage: three standalone ESP-IDF apps under `firmware/`. `hardware/` and `software/` are empty placeholders for future PCB/host-side work.
 
 ## Repo layout
 
 - `firmware/data_capture/` — main app: OV5640 camera + BMI270 IMU + WiFi + HTTP server, streams both to a host over the network.
 - `firmware/imu_testing/` — standalone BMI270 bring-up app (I2C bus scan + raw sample printout). Use this when debugging IMU wiring/config in isolation from the camera/WiFi stack.
+- `firmware/inference_on_esp32s3/` — on-device esp-dl inference: RGB565 camera frames → `espressif/hand_detect` → temporal wave detector (`main/wave_detector.hpp`, host-unit-tested in `test/`). Logs camera FPS / inference FPS over serial. Model is baked into flash by default (no SD card); SD mode optional. Doesn't use the BMI270 lib, so no worktree symlink needed. See `docs/inference_on_esp32s3.md`.
 - `firmware/camera_calibration/` — calibration target PDFs (ChArUco/circles/Kalibr boards), no code.
 - `firmware/esp-idf/` — full ESP-IDF SDK checkout (v5.3.5, target esp32s3). Gitignored — treat as a local toolchain install, not project source.
 - `SparkFun_BMI270_Arduino_Library/` — vendored BMI270 driver. Only `src/bmi270_api/bmi2.c` and `bmi270.c` are used; both firmware apps compile these two files directly into their `main` component (see each `main/CMakeLists.txt`) rather than consuming it as an ESP-IDF component or Arduino library.
@@ -22,7 +23,7 @@ The project is currently at the firmware bring-up stage: two standalone ESP-IDF 
 
 ## Build / flash / monitor
 
-Each app is built from its own project directory, not from the repo root. There are currently two ESP32-S3 projects: `firmware/data_capture` and `firmware/imu_testing`.
+Each app is built from its own project directory, not from the repo root. There are currently three ESP32-S3 projects: `firmware/data_capture`, `firmware/imu_testing` and `firmware/inference_on_esp32s3`.
 
 ```bash
 source ~/.espressif/tools/activate_idf_v5.3.5.sh   # put idf.py and toolchain on PATH (once per shell)

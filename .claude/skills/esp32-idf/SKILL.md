@@ -1,14 +1,15 @@
 ---
 name: esp32-idf
-description: Build, flash, and monitor the ESP32-S3 firmware projects in firmware/ (data_capture, imu_testing). Use whenever the user asks to build, flash, or read serial logs from the ESP32-S3 boards.
+description: Build, flash, and monitor the ESP32-S3 firmware projects in firmware/ (data_capture, imu_testing, inference_on_esp32s3). Use whenever the user asks to build, flash, or read serial logs from the ESP32-S3 boards.
 ---
 
 # ESP32-S3 IDF workflow
 
-This repo has two independent ESP-IDF projects under `firmware/`:
+This repo has three independent ESP-IDF projects under `firmware/`:
 
 - `data_capture` — camera + IMU + WiFi + HTTP server (main app).
 - `imu_testing` — standalone BMI270 bring-up (I2C scan + raw sample printout).
+- `inference_on_esp32s3` — on-device esp-dl hand detection + wave recognition.
 
 Each is built from its own project directory; there is no shared top-level
 build. The ESP-IDF toolchain is not on PATH by default — it must be sourced
@@ -21,7 +22,7 @@ for you. Prefer them over hand-rolling `idf.py` invocations.
 ## Build
 
 ```bash
-.claude/skills/esp32-idf/scripts/build.sh <data_capture|imu_testing>
+.claude/skills/esp32-idf/scripts/build.sh <data_capture|imu_testing|inference_on_esp32s3>
 ```
 
 Sources `~/.espressif/tools/activate_idf_v5.3.5.sh`, cds into the project,
@@ -37,7 +38,7 @@ Ctrl+C, so monitor exits cleanly), and writes both the raw and an
 ANSI-stripped log file.
 
 ```bash
-.claude/skills/esp32-idf/scripts/flash_monitor.sh <data_capture|imu_testing> [port] [duration_seconds] [log_path]
+.claude/skills/esp32-idf/scripts/flash_monitor.sh <data_capture|imu_testing|inference_on_esp32s3> [port] [duration_seconds] [log_path]
 # defaults: port=/dev/ttyACM0  duration_seconds=30  log_path=/tmp/esp32-idf/<project>.log
 ```
 

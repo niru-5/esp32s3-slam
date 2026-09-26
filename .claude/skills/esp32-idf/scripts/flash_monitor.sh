@@ -5,9 +5,9 @@ set -eo pipefail
 # fixed duration (monitor never exits on its own), then write an
 # ANSI-stripped log file that's easy to read/grep afterward.
 #
-# Usage: flash_monitor.sh <data_capture|imu_testing> [port] [duration_seconds] [log_path]
+# Usage: flash_monitor.sh <data_capture|imu_testing|inference_on_esp32s3> [port] [duration_seconds] [log_path]
 
-PROJECT="${1:?usage: flash_monitor.sh <data_capture|imu_testing> [port] [duration_seconds] [log_path]}"
+PROJECT="${1:?usage: flash_monitor.sh <data_capture|imu_testing|inference_on_esp32s3> [port] [duration_seconds] [log_path]}"
 PORT="${2:-/dev/ttyACM0}"
 DUR="${3:-30}"
 LOG="${4:-/tmp/esp32-idf/${PROJECT}.log}"

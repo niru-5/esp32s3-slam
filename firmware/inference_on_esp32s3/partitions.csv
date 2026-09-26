@@ -1,0 +1,6 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# esp-dl (~1.3MB firmware) + the hand-detect model packed into rodata (~0.5MB)
+# does not fit the 1MB default factory slot, so give it 4MB (flash is 8MB).
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, 0x10000, 0x400000,
