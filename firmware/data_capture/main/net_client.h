@@ -27,6 +27,10 @@
 esp_err_t net_client_pipeline_start(void);
 
 // Delete the wifi consumer tasks and close all persistent connections.
+// Only raise the stop flag (no waiting), so blocked sends/connects abort promptly. Call this BEFORE
+// sysstats_pipeline_stop(), then net_client_pipeline_stop() afterwards.
+void net_client_pipeline_request_stop(void);
+
 void net_client_pipeline_stop(void);
 
 // Push one system-stats snapshot payload (SYSSTATS_WIRE_LEN bytes). Called by

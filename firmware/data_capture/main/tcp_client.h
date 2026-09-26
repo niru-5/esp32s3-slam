@@ -36,7 +36,13 @@
 // send, not here. Returns ESP_OK once both tasks are running.
 esp_err_t tcp_client_pipeline_start(void);
 
-// Delete the tcp consumer tasks and close all three connections.
+// Ask the consumer tasks to finish (they exit themselves -- never vTaskDelete a task that may be
+// blocked in lwIP), wait for them, then close all three connections. Call sysstats_pipeline_stop()
+// first: the stats writer sends on the stats connection.
+// Only raise the stop flag (no waiting), so blocked sends/connects abort promptly. Call this BEFORE
+// sysstats_pipeline_stop(), then tcp_client_pipeline_stop() afterwards.
+void tcp_client_pipeline_request_stop(void);
+
 void tcp_client_pipeline_stop(void);
 
 // Push one system-stats snapshot payload (SYSSTATS_WIRE_LEN bytes) on the

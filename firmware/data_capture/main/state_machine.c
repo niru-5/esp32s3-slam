@@ -165,8 +165,9 @@ static void imu_calibration_run(void) {
 static void teardown_active_pipelines(void) {
     switch (s_state) {
     case APP_STATE_STREAM_WIFI:
+        net_client_pipeline_request_stop();   // abort in-flight sends so the stats writer stops quickly ...
+        sysstats_pipeline_stop();             // ... then it, before the sink: it sends on the sink's connection
         net_client_pipeline_stop();
-        sysstats_pipeline_stop();
         camera_pipeline_stop();
         imu_pipeline_stop();
         break;
@@ -177,8 +178,9 @@ static void teardown_active_pipelines(void) {
         imu_pipeline_stop();
         break;
     case APP_STATE_STREAM_TCP:
+        tcp_client_pipeline_request_stop();   // abort in-flight sends so the stats writer stops quickly ...
+        sysstats_pipeline_stop();             // ... then it, before the sink: it sends on the sink's connection
         tcp_client_pipeline_stop();
-        sysstats_pipeline_stop();
         camera_pipeline_stop();
         imu_pipeline_stop();
         break;
@@ -199,8 +201,8 @@ static void enter_stream_wifi(void) {
         net_client_pipeline_start() != ESP_OK ||
         sysstats_pipeline_start(SYSSTATS_SINK_WIFI) != ESP_OK) {
         ESP_LOGE(TAG, "failed to start wifi streaming pipeline — rolling back");
-        net_client_pipeline_stop();
         sysstats_pipeline_stop();
+        net_client_pipeline_stop();
         camera_pipeline_stop();
         imu_pipeline_stop();
         return;
@@ -241,8 +243,8 @@ static void enter_stream_tcp(void) {
         tcp_client_pipeline_start() != ESP_OK ||
         sysstats_pipeline_start(SYSSTATS_SINK_TCP) != ESP_OK) {
         ESP_LOGE(TAG, "failed to start tcp streaming pipeline — rolling back");
-        tcp_client_pipeline_stop();
         sysstats_pipeline_stop();
+        tcp_client_pipeline_stop();
         camera_pipeline_stop();
         imu_pipeline_stop();
         return;

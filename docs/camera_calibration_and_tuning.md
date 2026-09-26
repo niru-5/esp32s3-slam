@@ -133,4 +133,4 @@ cd software && .venv/bin/python -m unittest tests.test_calibration -v
 ## Ports and known issues
 
 * Host ports: **8084** (this tool, inbound from the device), 8080 (`STREAM_WIFI` HTTP), 8081–8083 (`STREAM_TCP` frame/IMU/stats). All must be open inbound on the host firewall.
-* Known, pre-existing (not part of this feature): if the `STREAM_TCP` ports are unreachable, stopping that mode with serial `3` panics inside lwIP's TCP timer, because `tcp_client_pipeline_stop()` `vTaskDelete`s consumer tasks that are blocked in `connect()`. Calibration mode stops cooperatively and is not affected. Verified on hardware: after a calibration session, `STREAM_WIFI` streams normally (≈22 fps to `host_server`) and stops cleanly.
+* Streaming consumers (`net_client.c`, `tcp_client.c`, the stats writer) shut down cooperatively — see `docs/learnings.md` §14. Verified on hardware: after a calibration session `STREAM_WIFI` and `STREAM_TCP` stream normally (≈22 fps) and stop cleanly, also with the host unreachable.

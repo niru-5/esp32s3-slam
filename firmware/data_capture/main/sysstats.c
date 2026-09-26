@@ -40,8 +40,6 @@ static bool     s_have_baseline = false;
 static temperature_sensor_handle_t s_temp = NULL;
 
 static QueueHandle_t s_stats_queue     = NULL;
-static TaskHandle_t  s_producer_handle = NULL;
-static TaskHandle_t  s_writer_handle   = NULL;
 static sysstats_sink_t s_sink;
 
 // Read the cumulative runtime of the two idle tasks. Returns false if the
@@ -198,10 +196,16 @@ size_t sysstats_snapshot_to_json(const sysstats_snapshot_t *s, char *out, size_t
 // Stats pipeline
 // --------------------------------------------------------------------------
 
+// Cooperative shutdown, same reasoning as net_client.c: the writer can be blocked in a network send,
+// and vTaskDelete()ing a task inside lwIP crashes lwIP's timer thread later.
+static volatile bool s_stats_stop  = false;
+static volatile int  s_stats_alive = 0;
+
 static void stats_producer_task(void *arg) {
     TickType_t last_wake = xTaskGetTickCount();
-    while (1) {
+    while (!s_stats_stop) {
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(CONFIG_STATS_PRODUCER_PERIOD_MS));
+        if (s_stats_stop) break;
 
         sysstats_snapshot_t snap;
         sysstats_fill(&snap);
@@ -213,12 +217,15 @@ static void stats_producer_task(void *arg) {
             ESP_LOGW(TAG, "stats_queue full, dropped oldest snapshot");
         }
     }
+    s_stats_alive--;
+    vTaskDelete(NULL);
 }
 
 static void stats_writer_task(void *arg) {
     TickType_t last_wake = xTaskGetTickCount();
-    while (1) {
+    while (!s_stats_stop) {
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(CONFIG_STATS_CONSUMER_PERIOD_MS));
+        if (s_stats_stop) break;
 
         sysstats_snapshot_t snap;
         if (xQueueReceive(s_stats_queue, &snap, 0) != pdTRUE) continue;
@@ -237,28 +244,33 @@ static void stats_writer_task(void *arg) {
             sdcard_write_stats((const uint8_t *)json, n);
         }
     }
+    s_stats_alive--;
+    vTaskDelete(NULL);
 }
 
 esp_err_t sysstats_pipeline_start(sysstats_sink_t sink) {
     s_sink = sink;
+    s_stats_stop = false;
+    s_stats_alive = 0;
     s_stats_queue = xQueueCreate(CONFIG_STATS_QUEUE_LEN, sizeof(sysstats_snapshot_t));
     if (!s_stats_queue) return ESP_ERR_NO_MEM;
 
+    s_stats_alive++;
     if (xTaskCreatePinnedToCore(stats_producer_task, "stats_prod", 4096, NULL,
-                                CONFIG_STATS_PRODUCER_PRIORITY, &s_producer_handle,
+                                CONFIG_STATS_PRODUCER_PRIORITY, NULL,
                                 CONFIG_STATS_PRODUCER_CORE) != pdPASS) {
+        s_stats_alive--;
         vQueueDelete(s_stats_queue);
         s_stats_queue = NULL;
         return ESP_ERR_NO_MEM;
     }
 
+    s_stats_alive++;
     if (xTaskCreatePinnedToCore(stats_writer_task, "stats_wr", 4096, NULL,
-                                CONFIG_STATS_CONSUMER_PRIORITY, &s_writer_handle,
+                                CONFIG_STATS_CONSUMER_PRIORITY, NULL,
                                 CONFIG_STATS_CONSUMER_CORE) != pdPASS) {
-        vTaskDelete(s_producer_handle);
-        s_producer_handle = NULL;
-        vQueueDelete(s_stats_queue);
-        s_stats_queue = NULL;
+        s_stats_alive--;
+        sysstats_pipeline_stop();
         return ESP_ERR_NO_MEM;
     }
 
@@ -269,7 +281,11 @@ esp_err_t sysstats_pipeline_start(sysstats_sink_t sink) {
 }
 
 void sysstats_pipeline_stop(void) {
-    if (s_producer_handle) { vTaskDelete(s_producer_handle); s_producer_handle = NULL; }
-    if (s_writer_handle)   { vTaskDelete(s_writer_handle);   s_writer_handle   = NULL; }
-    if (s_stats_queue)     { vQueueDelete(s_stats_queue);    s_stats_queue     = NULL; }
+    s_stats_stop = true;
+    for (int i = 0; i < 500 && s_stats_alive > 0; i++) vTaskDelay(pdMS_TO_TICKS(20));
+    if (s_stats_alive > 0) {
+        ESP_LOGE(TAG, "%d stats task(s) still busy after 10 s; leaving them to finish", (int)s_stats_alive);
+        return;
+    }
+    if (s_stats_queue) { vQueueDelete(s_stats_queue); s_stats_queue = NULL; }
 }
