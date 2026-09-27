@@ -4,42 +4,51 @@
 #include "esp_err.h"
 
 // --------------------------------------------------------------------------
-// Always-on device control channel — the network half of "host server as the
-// primary control surface" (docs/camera_calibration_and_tuning.md "Control
-// channel"). Unlike cam_calib.c's dedicated calibration socket (which only
-// exists while APP_STATE_CAMERA_CALIBRATION is active), this one is dialed at
-// boot and kept alive (with the same dial/retry/reconnect pattern cam_calib.c
-// uses) for the device's entire runtime, independent of app_state_t.
+// Always-on device control channel — the network half of "one host server,
+// one browser page" (docs/camera_calibration_and_tuning.md "Control
+// channel"). Dialed at boot and kept alive (dial/retry/reconnect) for the
+// device's entire runtime, independent of app_state_t. This is the device's
+// ONLY network-control socket: what used to be cam_calib.c's separate
+// dedicated calibration socket (CONFIG_CAM_CALIB_PORT) is merged in here --
+// that split only existed so two separate host processes wouldn't contend
+// for one port, and with a single host process (software/host_server) there
+// is no more reason for a second one.
 //
 // Device dials CONFIG_REMOTE_HOST:CONFIG_CONTROL_PORT; the host side is
-// software/host_server/control (a small always-running http.server app with a
-// browser UI). Same framing as cam_calib.c (uint32 len LE | uint8 type |
-// body), but this channel only ever carries MSG_JSON.
+// software/host_server (one process, one browser page). Framing: uint32 len
+// LE | uint8 type | body, type 0x01 JSON (both directions), type 0x02 IMAGE
+// (device -> host, camera_calibration captures only: uint32 meta_len | meta
+// JSON | frame bytes).
 //
-// Commands:
+// Commands (always available):
 //   ping
-//   get_status                                    -> {"state": "...", ...}
+//   get_status                    -> {"state":..,"imu_available":bool,...}
 //   set_state {"state": "idle"|"stream_wifi"|"stream_sdcard"|
-//              "stream_tcp"|"camera_calibration"|"imu_calibration"}
+//              "stream_tcp"|"camera_calibration"|"imu_calibration",
+//              "fps": n, "framesize": "...", "include_imu": bool}
 //     Translates to the same single-digit commands the serial console sends
 //     (state_machine.h) and posts it into the same command queue
 //     main_state_machine_task drains -- there is exactly one place that ever
-//     mutates the state, whether the request came from serial or here. The
-//     reply just confirms the request was queued; the transition itself
-//     happens asynchronously (within CONFIG_STATE_MACHINE_POLL_MS) -- poll
-//     get_status to observe the result, same as the serial console's "->
-//     STREAM_WIFI" log line is asynchronous relative to typing '1'.
-//   imu_cal_axis {"axis": 1-6}   answers the gravity-axis prompt that
-//                                imu_cal_preview (an event, not a reply) asks
-//                                for -- only meaningful while state is
-//                                imu_calibration; see state_machine.c
-//                                select_gravity_axis().
+//     mutates the state, whether the request came from serial or here.
+//     fps/framesize/include_imu only matter for the stream_* states (see
+//     state_machine_post_stream_params()); the reply just confirms the
+//     request was queued -- poll get_status to observe the actual result.
+//   imu_cal_axis {"axis": 1-6}   answers the gravity-axis prompt
+//                                (imu_cal_preview event) -- see
+//                                state_machine.c select_gravity_axis().
 //   imu_cal_abort                same effect as sending anything outside
 //                                1-6 on serial: aborts the calibration.
 //
-// Events (device -> host, unprompted, no "id"): imu_cal_preview (the same
-// 10-sample gravity-axis preview the serial console logs, see
-// state_machine.c), imu_cal_report (the same before/after FOC report).
+// Commands (only while state is camera_calibration -- "not in
+// camera_calibration" otherwise): info, set_mode, reg_read, reg_write,
+// reg_dump, set_orientation, fps_probe, capture, save_camera_regs,
+// clear_camera_regs, get_camera_overrides, exit -- see
+// docs/camera_calibration_and_tuning.md "Firmware side" for each one's
+// shape; unchanged from the old cam_calib.c protocol.
+//
+// Events (device -> host, unprompted, no "id"): imu_cal_preview, imu_cal_report
+// (state_machine.c's IMU calibration flow), reg_chunk (reg_dump's streamed
+// chunks, carries the requesting command's "id").
 // --------------------------------------------------------------------------
 
 // Spawn the control_link task (dial CONFIG_REMOTE_HOST:CONFIG_CONTROL_PORT,

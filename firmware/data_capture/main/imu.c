@@ -39,6 +39,7 @@ static QueueHandle_t      s_imu_queue          = NULL;
 static esp_timer_handle_t s_capture_timer      = NULL;
 static TaskHandle_t       s_capture_task_handle = NULL;
 static uint32_t           s_overflow_count      = 0;
+static bool               s_imu_ready           = false;   // imu_init() succeeded (see imu_available())
 
 // --------------------------------------------------------------------------
 // BMI2 I2C read/write/delay callbacks
@@ -259,18 +260,24 @@ static void imu_capture_task(void *arg) {
 
 esp_err_t imu_init(void) {
     esp_err_t err = bmi270_bringup();
+    s_imu_ready = err == ESP_OK;
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "IMU init failed — check wiring (SDA=GPIO%d SCL=GPIO%d addr=0x%02X)",
+        ESP_LOGW(TAG, "BMI270 IMU sensor not found (check wiring: SDA=GPIO%d SCL=GPIO%d addr=0x%02X) "
+                     "-- continuing without IMU",
                  IMU_SDA_GPIO, IMU_SCL_GPIO, BMI270_ADDR);
     }
     return err;
 }
 
+bool imu_available(void) {
+    return s_imu_ready;
+}
+
 esp_err_t imu_pipeline_start(void) {
-#if !CONFIG_ENABLE_IMU
-    ESP_LOGW(TAG, "IMU pipeline disabled (CONFIG_ENABLE_IMU=0) — skipping capture");
-    return ESP_OK;
-#endif
+    if (!s_imu_ready) {
+        ESP_LOGW(TAG, "IMU pipeline unavailable (no IMU sensor found at boot) -- skipping capture");
+        return ESP_ERR_INVALID_STATE;
+    }
 
     s_overflow_count = 0;
     s_imu_queue = xQueueCreate(CONFIG_IMU_QUEUE_LEN, sizeof(imu_sample_t));

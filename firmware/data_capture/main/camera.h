@@ -30,9 +30,18 @@ typedef struct {
     int64_t      ts_us;   // esp_timer us at grab time -- shared-clock reference
 } camera_frame_t;
 
-// Initialize the camera hardware only. Returns ESP_OK when ready for
-// camera_pipeline_start().
+// Initialize the camera hardware only, at the default streaming resolution
+// (FRAMESIZE_SVGA). Returns ESP_OK when ready for camera_pipeline_start().
 esp_err_t camera_init(void);
+
+// Same as camera_init(), but at an arbitrary streaming resolution -- used by
+// state_machine.c's enter_stream_*() when a specific framesize was requested
+// over the control channel. JPEG, CONFIG_CAMERA_JPEG_QUALITY_INITIAL quality,
+// CONFIG_CAMERA_FB_COUNT buffers, oldest-frame semantics -- same fixed
+// parameters as camera_init(), just a chosen `size` instead of always SVGA.
+// Also re-applies any NVS-persisted register overrides (see camera_overrides.h),
+// same as camera_init().
+esp_err_t camera_init_streaming(framesize_t size);
 
 // Re-initialize the camera in an arbitrary mode (deinit first if already up).
 // Used by camera calibration/tuning mode (cam_calib.c). Resets every sensor
@@ -44,11 +53,17 @@ esp_err_t camera_init(void);
 esp_err_t camera_init_ex(pixformat_t fmt, framesize_t size, int jpeg_quality,
                          int fb_count, bool raw8, bool grab_latest);
 
+// name -> framesize_t (e.g. "svga" -> FRAMESIZE_SVGA). Shared by camera_init_ex()
+// callers that take a framesize by name over the network (control_link.c's
+// set_mode and set_state commands). Returns false for an unknown name.
+bool camera_parse_framesize(const char *name, framesize_t *out);
+
 // Create camera_queue (CONFIG_CAMERA_QUEUE_LEN deep) and camera_capture_task
 // (prio CONFIG_CAMERA_CAPTURE_PRIORITY, core CONFIG_CAMERA_CAPTURE_CORE),
-// driven by an esp_timer at CONFIG_CAMERA_CAPTURE_PERIOD_MS. Returns ESP_OK
+// driven by an esp_timer at a period derived from `fps` (clamped 1-30 fps;
+// 0 means CONFIG_CAMERA_CAPTURE_FPS, the compiled default). Returns ESP_OK
 // once running.
-esp_err_t camera_pipeline_start(void);
+esp_err_t camera_pipeline_start(uint32_t fps);
 
 // Delete camera_capture_task, stop+delete its esp_timer, and
 // camera_release() + delete camera_queue (any frames still queued are

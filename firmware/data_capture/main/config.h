@@ -123,14 +123,23 @@
 #define CONFIG_STATE_MACHINE_TASK_STACK_SIZE 8192
 
 // --------------------------------------------------------------------------
-// Feature toggles — disable IMU or camera capture/streaming entirely to
-// isolate the other's performance (e.g. does turning off IMU logging speed
-// up camera frame writes on SD?). CONFIG_ENABLE_IMU=0 stops imu_capture_task
-// itself (imu.c) as well as both consumer paths (net_client.c, sdcard.c).
+// Feature toggles.
+//
+// CONFIG_ENABLE_IMU compiles IMU support in at all (imu_capture_task and both
+// consumer paths, net_client.c/tcp_client.c/sdcard.c) -- default on. Whether
+// the IMU is actually *used* is a separate, runtime question from here on:
+// imu_init() (data_capture.c) is non-fatal if the BMI270 doesn't respond
+// ("IMU sensor not found"), imu_available() (imu.h) reports the result, and
+// enter_stream_*()'s include_imu flag (state_machine.h) is what actually
+// gates whether a given streaming session includes IMU data -- see
+// docs/calibration.md. Set this to 0 only to fully compile IMU code out, e.g.
+// to isolate camera-only performance (does turning off IMU logging speed up
+// camera frame writes on SD?) -- not needed just because no IMU is wired up.
+//
 // CONFIG_ENABLE_CAMERA=0 only gates the consumer paths -- camera_capture_task
 // (camera.c) keeps running at its already-low FPS regardless.
 // --------------------------------------------------------------------------
-#define CONFIG_ENABLE_IMU     0
+#define CONFIG_ENABLE_IMU     1
 #define CONFIG_ENABLE_CAMERA  1
 
 // --------------------------------------------------------------------------
@@ -158,12 +167,13 @@
 #define CONFIG_CAMERA_CAPTURE_PRIORITY 10
 #define CONFIG_CAMERA_CAPTURE_CORE     1
 
-// Valid range 1-20 fps (i.e. capture period clamped 1000ms-50ms).
+// Default fps when camera_pipeline_start(0) is called (serial commands, which have
+// no way to carry a runtime fps) -- streaming commands over the control channel can
+// request any fps 1-30 instead (see camera_pipeline_start()'s own clamping).
 #define CONFIG_CAMERA_CAPTURE_FPS      25
 #if CONFIG_CAMERA_CAPTURE_FPS < 1 || CONFIG_CAMERA_CAPTURE_FPS > 30
-#error "CONFIG_CAMERA_CAPTURE_FPS must be between 1 and 20"
+#error "CONFIG_CAMERA_CAPTURE_FPS must be between 1 and 30"
 #endif
-#define CONFIG_CAMERA_CAPTURE_PERIOD_MS (1000 / CONFIG_CAMERA_CAPTURE_FPS)
 
 #define CONFIG_CAMERA_QUEUE_LEN      5   // CONFIG_CAMERA_CAPTURE_FPS
 

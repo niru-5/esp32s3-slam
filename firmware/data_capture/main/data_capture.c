@@ -116,11 +116,12 @@ void app_main(void) {
 
     if (camera_init() != ESP_OK) return;
 
-#if CONFIG_ENABLE_IMU
-    if (imu_init() != ESP_OK) return;
-#else
-    ESP_LOGW(TAG, "IMU disabled (CONFIG_ENABLE_IMU=0) — skipping imu_init()");
-#endif
+    // Non-fatal: a missing/unwired BMI270 shouldn't take the whole rig down.
+    // imu_init() already logs a clear "sensor not found" warning on failure;
+    // imu_available() (checked by imu_pipeline_start(), state_machine.c's
+    // IMU_CALIBRATION, and enter_stream_*()'s include_imu handling) reflects
+    // the result for the rest of the app's lifetime.
+    imu_init();
 
     sysstats_start();  // best-effort telemetry; failure is non-fatal
 

@@ -1,24 +1,35 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 // --------------------------------------------------------------------------
-// Owns the rig's runtime operating mode, driven by single-digit commands
-// polled from the console (see docs/architecture.md "Runtime state machine"):
+// Owns the rig's runtime operating mode, driven by two command sources that
+// funnel into the same handle_command()/enter_*() transitions: single-digit
+// serial commands (bring-up/recovery fallback) and control_link.c's set_state
+// (the primary path -- software/host_server's browser page), see
+// docs/architecture.md "Runtime state machine":
 //
-//   1 -> STREAM_WIFI        start camera+IMU capture, stream to the host over HTTP
-//   2 -> STREAM_SDCARD       start camera+IMU capture, log to the SD card
+//   1 -> STREAM_WIFI        start camera(+IMU) capture, stream to the host over HTTP
+//   2 -> STREAM_SDCARD       start camera(+IMU) capture, log to the SD card
 //   3 -> IDLE                stop streaming (any sink)
-//   4 -> IMU_CALIBRATION     provisioning stub, see state_machine.c
-//   5 -> CAMERA_CALIBRATION  host-driven camera calibration / ISP tuning session:
-//                            the device dials software/host_server/calibration on
-//                            the host (see cam_calib.h, docs/camera_calibration_and_tuning.md).
-//                            Stays in this state until the host sends "exit" or serial 3.
-//   6 -> STREAM_TCP          start camera+IMU capture, stream to the host over
+//   4 -> IMU_CALIBRATION     BMI270 hardware FOC bias calibration, see imu.h /
+//                            docs/calibration.md. Unavailable (logged, ignored)
+//                            when imu_available() is false.
+//   5 -> CAMERA_CALIBRATION  host-driven camera calibration / ISP tuning session
+//                            over control_link.c's channel (see cam_calib.h,
+//                            docs/camera_calibration_and_tuning.md). Stays in
+//                            this state until the host sends "exit" or serial 3.
+//   6 -> STREAM_TCP          start camera(+IMU) capture, stream to the host over
 //                            a raw TCP socket (see tcp_client.h) instead of
 //                            HTTP -- lower per-message overhead, same capture
 //                            pipelines as STREAM_WIFI.
+//
+// 1/2/6 also take an fps, a framesize, and whether to include IMU data (only
+// meaningful over the control link -- serial has no way to carry them, so
+// serial-triggered streams always use the compiled defaults) -- see
+// state_machine_post_stream_command() below.
 //
 // 1/2/6 switch directly between each other (no need to send 3 first); 4/5
 // force an implicit teardown of whatever streaming pipeline is active first.
@@ -55,10 +66,23 @@ esp_err_t state_machine_start(bool sdcard_available);
 // already drains every CONFIG_STATE_MACHINE_POLL_MS.
 // --------------------------------------------------------------------------
 
-// Post one command byte, same encoding as a serial digit ('1'-'6'). Returns
-// ESP_ERR_NO_MEM if the (8-deep) queue is full -- essentially unreachable at
-// the rate a host UI would send these.
+// Post one command byte, same encoding as a serial digit ('1'-'6'), with no
+// extra stream parameters (equivalent to state_machine_post_stream_command(c,
+// 0, "", false)). Returns ESP_ERR_NO_MEM if the (8-deep) queue is full --
+// essentially unreachable at the rate a host UI would send these.
 esp_err_t state_machine_post_command(char c);
+
+// Post a command with the extra parameters '1'/'2'/'6' (STREAM_WIFI/SDCARD/TCP)
+// use: `fps` (0 = compiled default, else clamped 1-30), `framesize` (a name
+// camera_parse_framesize() accepts, e.g. "svga"; "" = don't change the current
+// camera resolution) and `include_imu` (start the IMU pipeline too, if
+// imu_available()). Ignored (but still validated/enqueued) for every other
+// digit. Digit and params are enqueued as one item, not two separate calls,
+// so a second call before main_state_machine_task drains the first can't
+// clobber its params. Returns ESP_ERR_INVALID_ARG if `framesize` is non-empty
+// and not a name camera_parse_framesize() recognises, ESP_ERR_NO_MEM if the
+// queue is full, else ESP_OK.
+esp_err_t state_machine_post_stream_command(char c, uint32_t fps, const char *framesize, bool include_imu);
 
 // Answer the IMU-calibration gravity-axis prompt (state_machine.c
 // select_gravity_axis()) from the control link instead of the serial

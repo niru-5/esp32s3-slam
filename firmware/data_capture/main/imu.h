@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
 #include "esp_err.h"
@@ -49,8 +50,20 @@ typedef struct {
 // Bring up GPIO mode/address pins, I2C, and the BMI270 (accel+gyro, 1600Hz
 // ODR -- see imu.c for why 1600Hz rather than the previous 100Hz). Does NOT
 // start sampling -- call imu_pipeline_start() for that. Returns ESP_OK once
-// the chip is ready.
+// the chip is ready, ESP_FAIL if the BMI270 doesn't respond (not wired up /
+// not powered) -- a caller should treat that as non-fatal (see
+// data_capture.c) and continue without IMU; imu_available() reflects the
+// result afterward.
 esp_err_t imu_init(void);
+
+// True once imu_init() has succeeded; false before that call and after a
+// failed one (hardware not found). Every IMU-dependent path
+// (imu_pipeline_start(), state_machine.c's IMU_CALIBRATION,
+// enter_stream_*()'s include_imu handling) checks this at runtime instead of
+// relying on a compile-time toggle, so a genuinely-absent sensor is reported
+// clearly ("IMU sensor not found") rather than silently skipped or crashing
+// boot.
+bool imu_available(void);
 
 // Create imu_queue (CONFIG_IMU_QUEUE_LEN deep) and imu_capture_task (prio
 // CONFIG_IMU_CAPTURE_PRIORITY, core CONFIG_IMU_CAPTURE_CORE), driven by an

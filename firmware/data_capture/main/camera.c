@@ -1,5 +1,6 @@
 #include "camera.h"
 
+#include <string.h>
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -10,6 +11,20 @@
 #include "camera_overrides.h"
 
 static const char *TAG = "CAM";
+
+typedef struct { const char *name; framesize_t size; } size_entry_t;
+static const size_entry_t SIZES[] = {
+    {"qqvga", FRAMESIZE_QQVGA}, {"qvga", FRAMESIZE_QVGA}, {"cif", FRAMESIZE_CIF},
+    {"vga", FRAMESIZE_VGA},     {"svga", FRAMESIZE_SVGA}, {"xga", FRAMESIZE_XGA},
+    {"hd", FRAMESIZE_HD},       {"sxga", FRAMESIZE_SXGA}, {"uxga", FRAMESIZE_UXGA},
+    {"fhd", FRAMESIZE_FHD},     {"qxga", FRAMESIZE_QXGA}, {"5mp", FRAMESIZE_5MP},
+};
+
+bool camera_parse_framesize(const char *name, framesize_t *out) {
+    for (size_t i = 0; i < sizeof(SIZES) / sizeof(SIZES[0]); i++)
+        if (!strcmp(SIZES[i].name, name)) { *out = SIZES[i].size; return true; }
+    return false;
+}
 
 static QueueHandle_t      s_camera_queue        = NULL;
 static esp_timer_handle_t s_capture_timer       = NULL;
@@ -77,8 +92,8 @@ esp_err_t camera_init_ex(pixformat_t fmt, framesize_t size, int jpeg_quality,
     return ESP_OK;
 }
 
-esp_err_t camera_init(void) {
-    esp_err_t err = camera_init_ex(PIXFORMAT_JPEG, FRAMESIZE_SVGA, CONFIG_CAMERA_JPEG_QUALITY_INITIAL,
+esp_err_t camera_init_streaming(framesize_t size) {
+    esp_err_t err = camera_init_ex(PIXFORMAT_JPEG, size, CONFIG_CAMERA_JPEG_QUALITY_INITIAL,
                                    CONFIG_CAMERA_FB_COUNT, false, false);
     if (err != ESP_OK) return err;
     // Re-apply any NVS-persisted register overrides from a previous calibration
@@ -90,13 +105,17 @@ esp_err_t camera_init(void) {
     return ESP_OK;
 }
 
+esp_err_t camera_init(void) {
+    return camera_init_streaming(FRAMESIZE_SVGA);
+}
+
 void camera_release(camera_fb_t *fb) {
     if (fb) esp_camera_fb_return(fb);
 }
 
 // --------------------------------------------------------------------------
-// camera_capture_task — woken by esp_timer every
-// CONFIG_CAMERA_CAPTURE_PERIOD_MS via task-notify (see camera.h / imu.h for
+// camera_capture_task — woken by esp_timer every (runtime-derived, see
+// camera_pipeline_start()) period via task-notify (see camera.h / imu.h for
 // why not a FreeRTOS software timer).
 // --------------------------------------------------------------------------
 
@@ -162,7 +181,12 @@ static void camera_capture_task(void *arg) {
 // Public API
 // --------------------------------------------------------------------------
 
-esp_err_t camera_pipeline_start(void) {
+esp_err_t camera_pipeline_start(uint32_t fps) {
+    if (fps == 0) fps = CONFIG_CAMERA_CAPTURE_FPS;
+    if (fps < 1) fps = 1;
+    if (fps > 30) fps = 30;
+    uint32_t period_ms = 1000 / fps;
+
     s_overflow_count = 0;
 
     // Reset adaptive quality state fresh each session, mirroring the queues/
@@ -188,7 +212,7 @@ esp_err_t camera_pipeline_start(void) {
         .name     = "cam_cap_timer",
     };
     if (esp_timer_create(&timer_args, &s_capture_timer) != ESP_OK ||
-        esp_timer_start_periodic(s_capture_timer, CONFIG_CAMERA_CAPTURE_PERIOD_MS * 1000ULL) != ESP_OK) {
+        esp_timer_start_periodic(s_capture_timer, period_ms * 1000ULL) != ESP_OK) {
         vTaskDelete(s_capture_task_handle);
         s_capture_task_handle = NULL;
         vQueueDelete(s_camera_queue);
@@ -196,8 +220,8 @@ esp_err_t camera_pipeline_start(void) {
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "capture pipeline started (%d ms period, queue depth %d)",
-             CONFIG_CAMERA_CAPTURE_PERIOD_MS, CONFIG_CAMERA_QUEUE_LEN);
+    ESP_LOGI(TAG, "capture pipeline started (%lu ms period / %lu fps requested, queue depth %d)",
+             (unsigned long)period_ms, (unsigned long)fps, CONFIG_CAMERA_QUEUE_LEN);
     return ESP_OK;
 }
 

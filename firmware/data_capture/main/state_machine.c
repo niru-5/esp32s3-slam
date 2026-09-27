@@ -1,6 +1,7 @@
 #include "state_machine.h"
 
 #include <stdio.h>
+#include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include "esp_log.h"
@@ -26,10 +27,18 @@ static app_state_t s_state             = APP_STATE_IDLE;
 static bool        s_sdcard_available  = false;
 
 // Second command source (control_link.c) -- see state_machine.h. s_cmd_queue
-// carries synthetic serial-digit-equivalent commands; s_imu_answer_queue
-// carries the IMU-calibration gravity-axis answer, gated by
-// s_imu_axis_wait_active so a stray/late imu_cal_axis command outside the
+// carries synthetic serial-digit-equivalent commands (digit + optional stream
+// params, enqueued together -- see state_machine_post_stream_command());
+// s_imu_answer_queue carries the IMU-calibration gravity-axis answer, gated
+// by s_imu_axis_wait_active so a stray/late imu_cal_axis command outside the
 // actual prompt window is rejected rather than silently swallowed.
+typedef struct {
+    char     digit;
+    uint32_t fps;          // 0 = compiled default
+    char     framesize[8]; // "" = don't change the current camera resolution
+    bool     include_imu;
+} state_cmd_t;
+
 static QueueHandle_t   s_cmd_queue          = NULL;
 static QueueHandle_t   s_imu_answer_queue   = NULL;
 static volatile bool   s_imu_axis_wait_active = false;
@@ -121,10 +130,11 @@ static bool select_gravity_axis(imu_accel_foc_axis_t *out) {
 }
 
 static void imu_calibration_run(void) {
-#if !CONFIG_ENABLE_IMU
-    ESP_LOGW(TAG, "IMU calibration unavailable — IMU disabled (CONFIG_ENABLE_IMU=0) — ignoring command 4");
-    return;
-#endif
+    if (!imu_available()) {
+        ESP_LOGW(TAG, "IMU calibration unavailable — no IMU sensor found at boot — ignoring command 4");
+        control_link_send_event("{\"evt\":\"imu_cal_failed\",\"err\":\"no IMU sensor found\"}");
+        return;
+    }
 
     ESP_LOGI(TAG, "=== IMU hardware FOC calibration ===");
 
@@ -233,19 +243,41 @@ static void teardown_active_pipelines(void) {
         imu_pipeline_stop();
         break;
     case APP_STATE_CAMERA_CALIBRATION:
-        cam_calib_stop();
+        cam_calib_exit_mode();
         break;
     default:
         break;
     }
 }
 
-static void enter_stream_wifi(void) {
+// Reconfigure the camera for streaming if a specific resolution was requested
+// (framesize[0] != '\0'); otherwise leave whatever's currently configured
+// alone, matching the pre-existing behaviour of every enter_stream_*().
+static esp_err_t apply_requested_framesize(const char *framesize) {
+    if (!framesize || framesize[0] == '\0') return ESP_OK;
+    framesize_t size;
+    if (!camera_parse_framesize(framesize, &size)) {
+        ESP_LOGW(TAG, "unknown framesize %s -- keeping current camera resolution", framesize);
+        return ESP_OK;   // already validated by state_machine_post_stream_command(); defensive only
+    }
+    return camera_init_streaming(size);
+}
+
+// Only start the IMU pipeline when both the hardware is actually there and the
+// caller asked for it -- imu_pipeline_start() itself now refuses when
+// !imu_available(), so this is just the "did they even ask" half.
+static esp_err_t maybe_start_imu(bool include_imu) {
+    if (!include_imu || !imu_available()) return ESP_OK;
+    return imu_pipeline_start();
+}
+
+static void enter_stream_wifi(uint32_t fps, const char *framesize, bool include_imu) {
     teardown_active_pipelines();
     s_state = APP_STATE_IDLE;
+    apply_requested_framesize(framesize);
 
-    if (imu_pipeline_start() != ESP_OK ||
-        camera_pipeline_start() != ESP_OK ||
+    if (maybe_start_imu(include_imu) != ESP_OK ||
+        camera_pipeline_start(fps) != ESP_OK ||
         net_client_pipeline_start() != ESP_OK ||
         sysstats_pipeline_start(SYSSTATS_SINK_WIFI) != ESP_OK) {
         ESP_LOGE(TAG, "failed to start wifi streaming pipeline — rolling back");
@@ -256,19 +288,21 @@ static void enter_stream_wifi(void) {
         return;
     }
     s_state = APP_STATE_STREAM_WIFI;
-    ESP_LOGI(TAG, "-> STREAM_WIFI");
+    ESP_LOGI(TAG, "-> STREAM_WIFI (fps=%lu%s%s)", (unsigned long)(fps ? fps : CONFIG_CAMERA_CAPTURE_FPS),
+             framesize[0] ? " framesize=" : "", framesize[0] ? framesize : "");
 }
 
-static void enter_stream_sdcard(void) {
+static void enter_stream_sdcard(uint32_t fps, const char *framesize, bool include_imu) {
     if (!s_sdcard_available) {
         ESP_LOGW(TAG, "SD card unavailable — ignoring command 2");
         return;
     }
     teardown_active_pipelines();
     s_state = APP_STATE_IDLE;
+    apply_requested_framesize(framesize);
 
-    if (imu_pipeline_start() != ESP_OK ||
-        camera_pipeline_start() != ESP_OK ||
+    if (maybe_start_imu(include_imu) != ESP_OK ||
+        camera_pipeline_start(fps) != ESP_OK ||
         sdcard_pipeline_start() != ESP_OK ||
         sysstats_pipeline_start(SYSSTATS_SINK_SDCARD) != ESP_OK) {
         ESP_LOGE(TAG, "failed to start sdcard streaming pipeline — rolling back");
@@ -282,12 +316,13 @@ static void enter_stream_sdcard(void) {
     ESP_LOGI(TAG, "-> STREAM_SDCARD");
 }
 
-static void enter_stream_tcp(void) {
+static void enter_stream_tcp(uint32_t fps, const char *framesize, bool include_imu) {
     teardown_active_pipelines();
     s_state = APP_STATE_IDLE;
+    apply_requested_framesize(framesize);
 
-    if (imu_pipeline_start() != ESP_OK ||
-        camera_pipeline_start() != ESP_OK ||
+    if (maybe_start_imu(include_imu) != ESP_OK ||
+        camera_pipeline_start(fps) != ESP_OK ||
         tcp_client_pipeline_start() != ESP_OK ||
         sysstats_pipeline_start(SYSSTATS_SINK_TCP) != ESP_OK) {
         ESP_LOGE(TAG, "failed to start tcp streaming pipeline — rolling back");
@@ -298,7 +333,8 @@ static void enter_stream_tcp(void) {
         return;
     }
     s_state = APP_STATE_STREAM_TCP;
-    ESP_LOGI(TAG, "-> STREAM_TCP");
+    ESP_LOGI(TAG, "-> STREAM_TCP (fps=%lu%s%s)", (unsigned long)(fps ? fps : CONFIG_CAMERA_CAPTURE_FPS),
+             framesize[0] ? " framesize=" : "", framesize[0] ? framesize : "");
 }
 
 static void enter_idle(void) {
@@ -316,14 +352,17 @@ static void enter_imu_calibration(void) {
     s_state = APP_STATE_IDLE;
 }
 
-// Camera calibration/tuning is host-driven and long-lived: cam_calib_task owns
-// the camera and the control socket until the host sends "exit" (or serial 3).
-// We stay in APP_STATE_CAMERA_CALIBRATION meanwhile; the poll loop below drops
-// back to IDLE once the task has finished.
+// Camera calibration/tuning is host-driven but no longer needs its own task:
+// control_link.c's already-running channel serves the protocol (gated on
+// s_state == APP_STATE_CAMERA_CALIBRATION), so entering/leaving this state is
+// just a camera reconfigure, synchronous like every other transition here.
+// Left via control_link.c's "exit" command handler (cam_calib_exit_mode() +
+// state_machine_post_command('3')) or serial 3 (teardown_active_pipelines()
+// above).
 static void enter_camera_calibration(void) {
     teardown_active_pipelines();
     s_state = APP_STATE_IDLE;
-    if (cam_calib_start() != ESP_OK) {
+    if (cam_calib_enter_mode() != ESP_OK) {
         ESP_LOGE(TAG, "failed to start camera calibration");
         return;
     }
@@ -331,14 +370,14 @@ static void enter_camera_calibration(void) {
     ESP_LOGI(TAG, "-> CAMERA_CALIBRATION");
 }
 
-static void handle_command(char c) {
-    switch (c) {
-    case '1': enter_stream_wifi();                              break;
-    case '2': enter_stream_sdcard();                             break;
-    case '3': enter_idle();                                      break;
-    case '4': enter_imu_calibration();                            break;
-    case '5': enter_camera_calibration();                        break;
-    case '6': enter_stream_tcp();                                 break;
+static void handle_command(const state_cmd_t *cmd) {
+    switch (cmd->digit) {
+    case '1': enter_stream_wifi(cmd->fps, cmd->framesize, cmd->include_imu);   break;
+    case '2': enter_stream_sdcard(cmd->fps, cmd->framesize, cmd->include_imu); break;
+    case '3': enter_idle();                                                    break;
+    case '4': enter_imu_calibration();                                         break;
+    case '5': enter_camera_calibration();                                      break;
+    case '6': enter_stream_tcp(cmd->fps, cmd->framesize, cmd->include_imu);    break;
     default: break;  // ignore newlines / anything else
     }
 }
@@ -369,15 +408,13 @@ static void main_state_machine_task(void *arg) {
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(CONFIG_STATE_MACHINE_POLL_MS));
         int c;
-        while ((c = fgetc(stdin)) != EOF)
-            handle_command((char)c);
-        char qc;
-        while (xQueueReceive(s_cmd_queue, &qc, 0) == pdTRUE)
-            handle_command(qc);
-        if (s_state == APP_STATE_CAMERA_CALIBRATION && !cam_calib_active()) {
-            s_state = APP_STATE_IDLE;
-            ESP_LOGI(TAG, "camera calibration finished -> IDLE");
+        while ((c = fgetc(stdin)) != EOF) {
+            state_cmd_t cmd = { .digit = (char)c, .fps = 0, .framesize = "", .include_imu = false };
+            handle_command(&cmd);
         }
+        state_cmd_t qcmd;
+        while (xQueueReceive(s_cmd_queue, &qcmd, 0) == pdTRUE)
+            handle_command(&qcmd);
     }
 }
 
@@ -386,7 +423,7 @@ esp_err_t state_machine_start(bool sdcard_available) {
     if (!s_sdcard_available)
         ESP_LOGW(TAG, "SD card unavailable — command 2 (STREAM_SDCARD) will be rejected");
 
-    s_cmd_queue = xQueueCreate(8, sizeof(char));
+    s_cmd_queue = xQueueCreate(8, sizeof(state_cmd_t));
     s_imu_answer_queue = xQueueCreate(1, sizeof(char));
     if (!s_cmd_queue || !s_imu_answer_queue) return ESP_ERR_NO_MEM;
 
@@ -399,8 +436,20 @@ esp_err_t state_machine_start(bool sdcard_available) {
 }
 
 esp_err_t state_machine_post_command(char c) {
+    return state_machine_post_stream_command(c, 0, "", false);
+}
+
+esp_err_t state_machine_post_stream_command(char c, uint32_t fps, const char *framesize, bool include_imu) {
     if (!s_cmd_queue) return ESP_ERR_INVALID_STATE;
-    return xQueueSend(s_cmd_queue, &c, 0) == pdTRUE ? ESP_OK : ESP_ERR_NO_MEM;
+    state_cmd_t cmd = { .digit = c, .fps = fps, .include_imu = include_imu };
+    if (framesize && framesize[0]) {
+        framesize_t dummy;
+        if (!camera_parse_framesize(framesize, &dummy)) return ESP_ERR_INVALID_ARG;
+        strlcpy(cmd.framesize, framesize, sizeof(cmd.framesize));
+    } else {
+        cmd.framesize[0] = '\0';
+    }
+    return xQueueSend(s_cmd_queue, &cmd, 0) == pdTRUE ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
 bool state_machine_post_imu_axis(char c) {
