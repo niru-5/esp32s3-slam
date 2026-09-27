@@ -534,11 +534,12 @@ class Tuner:
         out(f"\nSET UP: {step.setup}")
         out(f"EXPECT: {step.expect}\n")
         if not yes:
-            try:
-                if input("press Enter when the scene is ready (q = skip): ").strip().lower() == "q":
-                    return
-            except EOFError:
-                pass
+            # self.app.readline(), not bare input(): the default implementation is input()
+            # (interactive cli.py terminal use), but the web calibration console (see
+            # console.py) overrides it per-instance to block on a queue instead, so a `tune`
+            # step run from the browser can wait for a "ready" click instead of a keypress.
+            if self.app.readline("press Enter when the scene is ready (q = skip): ").strip().lower() == "q":
+                return
         ctx = Ctx(self, step, opts, keep)
         mark = self.app.regs.mark()
         mode0 = dict(self.app.mode)

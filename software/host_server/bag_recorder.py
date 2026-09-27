@@ -175,3 +175,55 @@ class BagRecorder:
                 # SequentialWriter finalizes on destruction; drop the ref.
                 del self._writer
                 self._writer = None
+
+
+class RecordingSlot:
+    """Swappable BagRecorder holder so the browser's "record to ROS bag" toggle can
+    create/destroy a BagRecorder at runtime (host_server/app.py's set_recording command)
+    while every ingest handler (HTTP, TCP -- server.py, tcp_ingest.py) keeps a single
+    reference to this slot instead of a specific BagRecorder instance, unchanged from how
+    they already call `recorder.write_frame(...)` etc."""
+
+    def __init__(self) -> None:
+        self._current: BagRecorder | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def enabled(self) -> bool:
+        c = self._current
+        return c is not None and c.enabled
+
+    @property
+    def bag_uri(self) -> str:
+        c = self._current
+        return c.bag_uri if c is not None else ""
+
+    def start(self, bag_uri: str, storage_id: str = "sqlite3") -> bool:
+        """Returns True if recording actually started (False if ROS 2 isn't available)."""
+        with self._lock:
+            if self._current is not None:
+                self._current.close()
+            rec = BagRecorder(bag_uri, storage_id=storage_id)
+            self._current = rec
+            return rec.enabled
+
+    def stop(self) -> None:
+        with self._lock:
+            if self._current is not None:
+                self._current.close()
+            self._current = None
+
+    def write_frame(self, *args) -> None:
+        c = self._current
+        if c is not None:
+            c.write_frame(*args)
+
+    def write_imu(self, *args) -> None:
+        c = self._current
+        if c is not None:
+            c.write_imu(*args)
+
+    def write_stats(self, *args) -> None:
+        c = self._current
+        if c is not None:
+            c.write_stats(*args)

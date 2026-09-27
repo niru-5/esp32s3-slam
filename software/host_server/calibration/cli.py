@@ -1,20 +1,25 @@
-"""Interactive host side of the camera calibration / ISP tuning mode.
+"""Terminal client for the calibration console: register access, ISP tuning, checkerboard
+intrinsics -- the same session a browser's Calibration panel drives.
 
-    cd software && .venv/bin/python -m host_server.calibration run --serial /dev/ttyACM0
-    cd software && .venv/bin/python -m host_server.calibration run      # device already in mode 5
+    cd software && .venv/bin/python -m host_server.calibration run
+    cd software && .venv/bin/python -m host_server.calibration run --server http://otherhost:8080
 
-The tool listens on the control port (8084), (optionally) tells the ESP32-S3 to enter
-CAMERA_CALIBRATION over serial, waits for the device to dial in, opens a session folder
-and backs up every sensor register before anything is touched.
+`run` requires `python -m host_server` to already be running (locally or elsewhere --
+--server points at it) -- it puts the device into camera_calibration (if it isn't already)
+and talks to the SAME calibration console the browser's Calibration panel uses
+(host_server/app.py's CalibrationManager, host_server/calibration/console.py), over HTTP
+(/command, /calib/line, /calib/output, /calib/answer) instead of owning a device connection
+of its own. The App/RegisterBank/IntrinsicFlow/Tuner classes below are unchanged from when
+this *was* the thing owning the connection -- only the transport moved server-side.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import re
 import shlex
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -22,10 +27,17 @@ import numpy as np
 
 from . import intrinsics as ix
 from .flow import IntrinsicFlow, solve_offline
-from .link import DeviceLink, LinkError
+from .link import LinkError
 from .liveview import LiveView
 from .registers import RegisterBank, RegisterError, UNSAFE_RESTORE, diff_dumps, load_dump, save_dump
 from .session import Session, decode, default_root
+from ..device_session import DeviceSessionError
+
+# App.run_line()/do_exit() catch this alongside LinkError (calibration/link.py's DeviceLink,
+# used offline/by tests) so they work the same whether `link` is a DeviceLink or a
+# DeviceSession (host_server/device_session.py, the live one-server transport `run` -- see
+# ConsoleClient below -- talks to indirectly, through the server's own calibration console).
+LINK_ERRORS = (LinkError, DeviceSessionError)
 
 HELP = """\
 device / sensor
@@ -71,13 +83,24 @@ def _num(s: str) -> int:
 
 
 class App:
-    def __init__(self, link: DeviceLink, session: Session, view: LiveView, board: ix.Board, out=print):
+    def __init__(self, link, session: Session, view: LiveView, board: ix.Board, out=print, readline=None):
         self.link, self.session, self.view, self.out = link, session, view, out
         self.regs = RegisterBank(link)
         self.flow = IntrinsicFlow(link, session, board, view, out)
         self.mode = {"fmt": link.hello.get("fmt", "jpeg"), "size": link.hello.get("size", "svga")}
         self.startup_dump: dict[int, int] = {}
         self.tuner = None
+        # Overridable per-instance (see host_server/calibration/console.py): the web
+        # calibration console blocks on a queue instead of real stdin, so a `tune` step
+        # run from the browser can wait for a "ready" click instead of a keypress.
+        if readline is not None:
+            self.readline = readline
+
+    def readline(self, prompt: str = "") -> str:
+        try:
+            return input(prompt)
+        except EOFError:
+            return ""
 
     # -- helpers -----------------------------------------------------------
     def backup(self, name: str) -> Path:
@@ -129,7 +152,7 @@ class App:
                 self.out(f"unknown command {cmd!r} -- try `help`")
                 return True
             return fn(args) is not False
-        except (LinkError, RegisterError, ValueError) as exc:
+        except (*LINK_ERRORS, RegisterError, ValueError) as exc:
             self.out(f"error: {exc}")
             if not self.link.connected:
                 self.out("device link lost -- waiting for it to reconnect on its own...")
@@ -326,7 +349,7 @@ class App:
     def do_exit(self, a):
         try:
             self.link.call("exit", timeout=10)
-        except LinkError:
+        except LINK_ERRORS:
             pass
         self.out("device left calibration mode (streaming camera config restored)")
         return False
@@ -335,131 +358,116 @@ class App:
         return False
 
 
-def _enter_mode_over_serial(port: str, out) -> tuple:
-    """Open the console, wait for the firmware's "ready" line, send '5'.
+class ConsoleClientError(RuntimeError):
+    pass
 
-    Opening the port resets the ESP32-S3 (USB-Serial-JTAG), and so does closing
-    it again on this setup, so the handle is returned and kept open for the
-    whole session -- a command sent before boot finishes would be lost.
+
+class ConsoleClient:
+    """Thin HTTP client for an already-running `python -m host_server`'s calibration
+    console endpoints (/command, /calib/line, /calib/output, /calib/answer) -- this is
+    cli.py's whole connection to the device now. The App/Session/RegisterBank/etc. all run
+    server-side (host_server/app.py's CalibrationManager), shared with the browser page's
+    Calibration panel -- `run` is just another client of the same running session, not a
+    second one. No serial cable, no separate port: whatever's already entering/driving
+    calibration mode (the browser, or this tool) works the same way.
     """
-    import serial
-    s = serial.Serial()
-    s.port, s.baudrate, s.dtr, s.rts, s.timeout = port, 115200, False, False, 0.2
-    s.open()
-    out(f"waiting for firmware boot on {port} ...")
-    buf, t0 = b"", time.monotonic()
-    while b"Returned from app_main" not in buf:
-        buf += s.read(4096)
-        if time.monotonic() - t0 > 40:
-            out("no 'ready' line seen (already running?) -- sending '5' anyway")
-            break
-    m = re.search(rb"IP: (\d+\.\d+\.\d+\.\d+)", buf)
-    time.sleep(0.5)
-    s.write(b"5\n")
-    s.flush()
-    out(f"sent '5' (CAMERA_CALIBRATION) on {port}")
-    return s, (m.group(1).decode() if m else None)
 
+    def __init__(self, base_url: str):
+        self.base = base_url.rstrip("/")
+        self._since = 0
 
-def _request_calibration_via_control(base_url: str, out) -> bool:
-    """Ask an already-running `host_server.control` app (see software/host_server/control) to
-    flip the device into camera_calibration over the always-on control channel, instead of
-    needing a serial cable. Best-effort: returns False (never raises) if nothing's listening
-    there, or the device isn't reachable through it yet -- the caller falls back to assuming
-    the device is already in calibration mode (or to --serial)."""
-    import json as _json
-    import urllib.error
-    import urllib.request
+    def _request(self, method: str, path: str, obj: dict | None = None) -> dict:
+        import json as _json
+        import urllib.error
+        import urllib.request
+        data = _json.dumps(obj).encode() if obj is not None else None
+        req = urllib.request.Request(self.base + path, data=data, method=method,
+                                     headers={"Content-Type": "application/json"} if data else {})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return _json.loads(resp.read())
+        except (OSError, urllib.error.URLError) as exc:
+            raise ConsoleClientError(f"{self.base}: {exc}") from exc
 
-    payload = _json.dumps({"cmd": "set_state", "state": "camera_calibration"}).encode()
-    req = urllib.request.Request(base_url.rstrip("/") + "/command", data=payload,
-                                 headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = _json.loads(resp.read())
-    except (OSError, urllib.error.URLError) as exc:
-        out(f"  (control app not reachable at {base_url}: {exc} -- assuming the device is "
-            f"already in calibration mode, or pass --serial)")
-        return False
-    if not data.get("ok"):
-        out(f"  control app at {base_url} rejected the request: {data.get('err')}")
-        return False
-    out(f"  requested camera_calibration via the control app at {base_url}")
-    return True
+    def enter_calibration(self, timeout: float = 15.0) -> None:
+        r = self._request("POST", "/command", {"cmd": "set_state", "state": "camera_calibration"})
+        if not r.get("ok"):
+            raise ConsoleClientError(r.get("err", "set_state failed"))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._request("GET", f"/calib/output.json?since={self._since}").get("active"):
+                return
+            time.sleep(0.3)
+        raise ConsoleClientError("timed out waiting for the calibration console to start "
+                                 "(is the device connected to the server?)")
 
+    def _poll_once(self) -> dict:
+        j = self._request("GET", f"/calib/output.json?since={self._since}")
+        self._since = j.get("next", self._since)
+        for line in j.get("lines", []):
+            print(line)
+        return j
 
-def _tee_serial(ser, path: Path) -> None:
-    """Keep draining the console into <session>/device.log (firmware ESP_LOG output)."""
-    import threading
+    def submit(self, line: str) -> None:
+        j = self._poll_once()
+        endpoint = "/calib/answer" if j.get("waiting_for_answer") else "/calib/line"
+        self._request("POST", endpoint, {"line": line})
 
-    def pump():
-        with open(path, "ab") as f:
-            while ser.is_open:
-                try:
-                    d = ser.read(4096)
-                except Exception:
-                    return
-                if d:
-                    f.write(d)
-                    f.flush()
-    threading.Thread(target=pump, daemon=True).start()
+    def wait_idle(self, timeout: float = 300.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self._poll_once().get("busy"):
+                return
+            time.sleep(0.2)
+
+    def tail(self, stop) -> None:
+        while not stop.is_set():
+            try:
+                self._poll_once()
+            except ConsoleClientError:
+                pass
+            time.sleep(0.3)
 
 
 def cmd_run(args) -> int:
-    board = ix.Board(args.cols, args.rows, args.square_mm)
-    link = DeviceLink("0.0.0.0", args.port)          # listen before the device is told to connect
-    view = LiveView(args.view_port)
-    print(f"listening for the device on :{args.port}   live view http://localhost:{args.view_port}/")
-    ser = None
-    if args.serial:
-        ser, _ = _enter_mode_over_serial(args.serial, print)
-    elif not args.no_control:
-        _request_calibration_via_control(args.control_http, print)
+    client = ConsoleClient(args.server)
+    print(f"connecting to {args.server} ...")
     try:
-        hello = link.wait_for_device(args.wait, on_wait=lambda: print(
-            "  ... waiting for the device to connect (put it in camera calibration mode: serial command 5)"))
-    except LinkError as exc:
-        print(exc)
-        if ser is not None:
-            ser.close()
+        client.enter_calibration()
+    except ConsoleClientError as exc:
+        print(f"error: {exc}")
         return 1
-    session = Session(Path(args.out) if args.out else default_root(), args.name)
-    session.update_meta(device_hello=hello, peer=str(link.peer))
-    print(f"device connected from {link.peer[0]}: {hello}")
-    print(f"session folder: {session.dir}")
-    if ser is not None:
-        _tee_serial(ser, session.dir / "device.log")
-    app = App(link, session, view, board)
-    app.view_port = args.view_port
+    print("entered camera_calibration (or was already there) -- type `help` for commands, "
+         "Ctrl-D/Ctrl-C to leave the terminal (device stays in calibration mode)\n")
+
+    cmds = [c.strip() for c in args.commands.split(";")] if args.commands else None
+    if cmds is not None:
+        for c in cmds:
+            print(f"\n> {c}")
+            client.submit(c)
+            client.wait_idle()
+        if args.then_exit:
+            client.submit("exit")
+            client.wait_idle()
+        return 0
+
+    stop = threading.Event()
+    tailer = threading.Thread(target=client.tail, args=(stop,), daemon=True)
+    tailer.start()
     try:
-        app.startup_backup()
-        cmds = [c.strip() for c in args.commands.split(";")] if args.commands else None
-        if cmds is not None:
-            for c in cmds:
-                print(f"\n> {c}")
-                if not app.run_line(c):
-                    break
-            if args.then_exit:
-                app.run_line("exit")
-        else:
-            print("\ntype `help` for commands\n")
-            while True:
-                try:
-                    line = input("calib> ")
-                except (EOFError, KeyboardInterrupt):
-                    print()
-                    break
-                if line.strip() == "help":
-                    app.do_help([])
-                    continue
-                if not app.run_line(line):
-                    break
+        while True:
+            try:
+                line = input()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if line.strip() == "help":
+                print(HELP)
+                continue
+            client.submit(line)
     finally:
-        link.close()
-        view.close()
-        if ser is not None:
-            ser.close()
-    print(f"session saved in {session.dir}")
+        stop.set()
+        tailer.join(timeout=2.0)
     return 0
 
 
@@ -485,22 +493,17 @@ def main(argv=None) -> int:
         p.add_argument("--rows", type=int, default=6, help="inner corners along y")
         p.add_argument("--square-mm", type=float, default=25.0)
 
-    r = sub.add_parser("run", help="interactive calibration/tuning session")
-    board_args(r)
-    r.add_argument("--port", type=int, default=8084, help="control port to listen on (CONFIG_CAM_CALIB_PORT)")
-    r.add_argument("--view-port", type=int, default=8090)
-    r.add_argument("--serial", help="serial port: send '5' to put the device in calibration mode")
-    r.add_argument("--control-http", default="http://localhost:8091",
-                   help="host_server.control app to request camera_calibration through, if --serial "
-                        "isn't given and one happens to be running (default: %(default)s)")
-    r.add_argument("--no-control", action="store_true",
-                   help="don't try --control-http; assume the device is already in calibration mode")
-    r.add_argument("--wait", type=float, default=90.0, help="seconds to wait for the device to start listening")
-    r.add_argument("--out", help=f"session root (default {default_root()})")
-    r.add_argument("--name", help="session folder name (default: timestamp)")
+    r = sub.add_parser("run", help="terminal client for the calibration console "
+                                   "(requires `python -m host_server` already running)")
+    r.add_argument("--server", default="http://localhost:8080",
+                   help="host_server base URL (default: %(default)s)")
     r.add_argument("-c", "--commands", help="run ';'-separated commands then quit (scripted use)")
-    r.add_argument("--then-exit", action="store_true", help="with -c: send `exit` to the device afterwards")
+    r.add_argument("--then-exit", action="store_true", help="with -c: send `exit` afterwards "
+                                                             "(leaves calibration mode)")
     r.set_defaults(fn=cmd_run)
+    # Board dimensions for a `run` session are set live via the console's own `board <cols>
+    # <rows> <square_mm>` command (default 9 6 25, same as board_args() below) -- there's no
+    # separate connection step anymore to attach flags to.
 
     s = sub.add_parser("solve", help="solve intrinsics offline from a saved session")
     board_args(s)

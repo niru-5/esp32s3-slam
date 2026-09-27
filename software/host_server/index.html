@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32-S3 SLAM</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0d0f12; color: #e6e8eb;
+         font: 14px/1.5 system-ui, sans-serif; }
+  header { padding: 14px 20px; border-bottom: 1px solid #23262b;
+           display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .dot.on  { background: #63d2a3; }
+  .dot.off { background: #ff6b6b; }
+  main { display: grid; grid-template-columns: minmax(320px, 1fr) 320px;
+         gap: 20px; padding: 20px; align-items: start; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+  .panel { background: #16191d; border: 1px solid #23262b; border-radius: 8px;
+           padding: 16px; margin-bottom: 16px; }
+  .panel h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
+              color: #9aa0a6; margin: 0 0 12px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; align-items: center; }
+  button { background: #23262b; color: #e6e8eb; border: 1px solid #33373d;
+           border-radius: 6px; padding: 7px 12px; font-size: 13px; cursor: pointer; }
+  button:hover { background: #2c3036; }
+  button.active { background: #2b4a6b; border-color: #4c9aff; color: #fff; }
+  button.danger:hover { background: #3b1f24; border-color: #ff8080; }
+  button:disabled { opacity: .35; cursor: default; }
+  button.sm { padding: 4px 9px; font-size: 12px; }
+  input[type=text], input[type=number], select {
+    background: #1b1e22; color: #e6e8eb; border: 1px solid #33373d; border-radius: 5px;
+    padding: 6px 8px; font-size: 13px; }
+  input[type=number] { width: 70px; }
+  label.field { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: #9aa0a6; }
+  label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+  .sub { margin-top: 10px; padding-top: 10px; border-top: 1px dashed #23262b; }
+  .stat { display: flex; justify-content: space-between; padding: 3px 0; }
+  .stat b { font-variant-numeric: tabular-nums; }
+  .muted { color: #9aa0a6; font-size: 12.5px; }
+  code { background: #1b1e22; padding: 1px 5px; border-radius: 4px; }
+  .banner { padding: 9px 11px; border-radius: 6px; margin-bottom: 10px; font-size: 12.5px; }
+  .banner.warn { background: #3b2f1f; color: #ffb454; }
+  .banner.ok   { background: #1f3b2a; color: #63d2a3; }
+  .frame { background: #000; border: 1px solid #23262b; border-radius: 8px; overflow: hidden; margin-bottom: 12px; }
+  .frame img { display: block; width: 100%; height: auto; }
+  .axisgrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; max-width: 300px; }
+  .steps { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+  .console { background: #0a0c0e; border: 1px solid #23262b; border-radius: 6px; padding: 8px;
+             height: 260px; overflow-y: auto; font: 12px/1.5 ui-monospace, monospace;
+             white-space: pre-wrap; word-break: break-word; }
+  .console .prompt { color: #63d2a3; }
+  .console-input { display: flex; gap: 6px; margin-top: 8px; }
+  .console-input input { flex: 1; font: 13px ui-monospace, monospace; }
+  .load { margin: 6px 0; }
+  .load .lbl { display: flex; justify-content: space-between; font-size: 12px; color: #9aa0a6; margin-bottom: 3px; }
+  .bar { height: 6px; background: #23262b; border-radius: 3px; overflow: hidden; }
+  .bar > span { display: block; height: 100%; width: 0; background: #4c9aff; transition: width .2s; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ESP32-S3 SLAM</h1>
+  <span><span id="dot" class="dot off"></span><span id="conn">connecting…</span></span>
+  <span class="muted" id="state_lbl"></span>
+</header>
+<main>
+  <div>
+    <div class="panel">
+      <h2>Mode</h2>
+      <div class="row">
+        <button id="mode-stream">Streaming</button>
+        <button id="mode-calib">Calibration</button>
+      </div>
+
+      <!-- ===================== Streaming ===================== -->
+      <div id="stream-panel" class="sub" style="display:none">
+        <div class="row">
+          <button id="sink-wifi">WiFi</button>
+          <button id="sink-sdcard">SD card</button>
+          <button id="sink-tcp">TCP</button>
+          <button id="sink-idle">Stop</button>
+        </div>
+        <div class="row">
+          <label class="field">fps <input type="number" id="fps" min="1" max="30" value="25"></label>
+          <label class="field">resolution
+            <select id="framesize">
+              <option value="">(unchanged)</option>
+              <option value="qqvga">qqvga</option><option value="qvga">qvga</option>
+              <option value="cif">cif</option><option value="vga">vga</option>
+              <option value="svga" selected>svga</option><option value="xga">xga</option>
+              <option value="hd">hd</option><option value="sxga">sxga</option>
+              <option value="uxga">uxga</option><option value="fhd">fhd</option>
+              <option value="qxga">qxga</option><option value="5mp">5mp</option>
+            </select>
+          </label>
+          <label class="check"><input type="checkbox" id="include_imu"> include IMU</label>
+          <span id="imu_note" class="muted"></span>
+        </div>
+        <div class="row">
+          <label class="check"><input type="checkbox" id="record"> record to ROS bag</label>
+          <span class="muted" id="bag_uri"></span>
+        </div>
+        <div class="frame"><img id="cam" alt="camera stream" src="/stream.mjpg"></div>
+      </div>
+
+      <!-- ===================== Calibration ===================== -->
+      <div id="calib-panel" class="sub" style="display:none">
+        <div class="row">
+          <button id="target-camera">Camera</button>
+          <button id="target-imu">IMU</button>
+        </div>
+
+        <div id="camera-sub" style="display:none">
+          <div class="frame"><img id="calib_img" alt="calibration capture" src="/calib/live.jpg"></div>
+          <div class="row">
+            <button id="capture-single" class="sm">Capture single image</button>
+            <button id="save-apply" class="sm">Save tuned registers</button>
+            <button id="save-status" class="sm">Save status</button>
+            <button id="save-clear" class="sm">Clear saved</button>
+          </div>
+          <div class="muted" style="margin-bottom:8px">ISP tuning steps (each backs up registers,
+            asks you to set up the scene, applies variants, reports before/after):</div>
+          <div class="steps" id="tune-steps"></div>
+          <div class="row">
+            <button id="cal-auto" class="sm">cal auto 20</button>
+            <button id="cal-solve" class="sm">cal solve --save</button>
+            <button id="cal-status" class="sm">cal status</button>
+          </div>
+          <div class="muted">Console — any <code>cli.py</code> command (<code>reg</code>,
+            <code>regw</code>, <code>tune &lt;step&gt;</code>, <code>cal ...</code>,
+            <code>save ...</code>, <code>help</code> for the full list):</div>
+          <div class="console" id="console"></div>
+          <div class="console-input">
+            <input type="text" id="console-in" placeholder="calib&gt; help" autocomplete="off">
+            <button id="console-send" class="sm">Send</button>
+          </div>
+        </div>
+
+        <div id="imu-sub" style="display:none">
+          <div id="imu-idle" class="muted">Click "IMU" above to start a calibration run.</div>
+          <div id="imu-prompt" style="display:none">
+            <p id="imu-prompt-text" class="muted"></p>
+            <div class="axisgrid">
+              <button data-axis="1">1&nbsp;&nbsp;+X</button>
+              <button data-axis="2">2&nbsp;&nbsp;-X</button>
+              <button data-axis="3">3&nbsp;&nbsp;+Y</button>
+              <button data-axis="4">4&nbsp;&nbsp;-Y</button>
+              <button data-axis="5">5&nbsp;&nbsp;+Z</button>
+              <button data-axis="6">6&nbsp;&nbsp;-Z</button>
+            </div>
+            <div class="row" style="margin-top:10px"><button id="imu-abort" class="danger">Abort</button></div>
+          </div>
+          <div id="imu-report" style="display:none"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div>
+    <div class="panel">
+      <h2>Device</h2>
+      <div class="stat"><span>State</span><b id="state">–</b></div>
+      <div class="stat"><span>Uptime</span><b id="uptime">–</b></div>
+      <div class="stat"><span>Heap free</span><b id="heap">–</b></div>
+      <div class="stat"><span>PSRAM free</span><b id="psram">–</b></div>
+      <div class="stat"><span>IMU</span><b id="imu_avail">–</b></div>
+    </div>
+    <div class="panel">
+      <h2>Stream</h2>
+      <div class="stat"><span>Frames</span><b id="frame_count">0</b></div>
+      <div class="stat"><span>Frame rate</span><b id="frame_fps">0</b> fps</div>
+      <div class="stat"><span>IMU samples</span><b id="imu_count">0</b></div>
+      <div class="stat"><span>IMU rate</span><b id="imu_hz">0</b> Hz</div>
+      <div class="load">
+        <div class="lbl"><span>CPU core 0</span><b id="cpu0">–</b></div>
+        <div class="bar"><span id="cpu0bar"></span></div>
+      </div>
+      <div class="load">
+        <div class="lbl"><span>CPU core 1</span><b id="cpu1">–</b></div>
+        <div class="bar"><span id="cpu1bar"></span></div>
+      </div>
+      <div class="stat"><span>WiFi RSSI</span><b id="rssi">–</b> dBm</div>
+    </div>
+  </div>
+</main>
+<script>
+const TUNE_STEPS = ["orientation","timing","black_level","lens_shading","awb","ccm","gamma","dpc","cip","aec_banding"];
+const STATE_NAMES = {stream_wifi:"Streaming (WiFi)", stream_sdcard:"Streaming (SD card)",
+  stream_tcp:"Streaming (TCP)", idle:"Idle", camera_calibration:"Camera calibration",
+  imu_calibration:"IMU calibration", unknown:"Unknown"};
+
+async function post(cmd, extra) {
+  const r = await fetch("/command", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify(Object.assign({cmd}, extra || {}))});
+  return r.json();
+}
+function setActive(ids, activeId) {
+  for (const id of ids) document.getElementById(id).classList.toggle("active", id === activeId);
+}
+function f(x, d) { return (x === undefined || x === null) ? "–" : Number(x).toFixed(d); }
+function kib(n) { return n === undefined || n === null ? "–" : (n / 1024).toFixed(1) + " KiB"; }
+function loadColor(pct) { return pct >= 85 ? "#ff6b6b" : pct >= 60 ? "#ffb454" : "#4c9aff"; }
+function setCpu(pctId, barId, pct) {
+  const p = Math.max(0, Math.min(100, pct || 0));
+  document.getElementById(pctId).textContent = p.toFixed(1) + " %";
+  const bar = document.getElementById(barId);
+  bar.style.width = p + "%"; bar.style.background = loadColor(p);
+}
+
+// ---- Mode / streaming ----
+document.getElementById("mode-stream").onclick = () => {
+  document.getElementById("stream-panel").style.display = "block";
+  document.getElementById("calib-panel").style.display = "none";
+  setActive(["mode-stream", "mode-calib"], "mode-stream");
+};
+document.getElementById("mode-calib").onclick = () => {
+  document.getElementById("stream-panel").style.display = "none";
+  document.getElementById("calib-panel").style.display = "block";
+  setActive(["mode-stream", "mode-calib"], "mode-calib");
+};
+function streamParams() {
+  return {
+    fps: Number(document.getElementById("fps").value) || 0,
+    framesize: document.getElementById("framesize").value,
+    include_imu: document.getElementById("include_imu").checked,
+  };
+}
+document.getElementById("sink-wifi").onclick   = () => post("set_state", Object.assign({state:"stream_wifi"}, streamParams()));
+document.getElementById("sink-sdcard").onclick = () => post("set_state", Object.assign({state:"stream_sdcard"}, streamParams()));
+document.getElementById("sink-tcp").onclick    = () => post("set_state", Object.assign({state:"stream_tcp"}, streamParams()));
+document.getElementById("sink-idle").onclick   = () => post("set_state", {state:"idle"});
+document.getElementById("record").onchange = (e) => post("set_recording", {enabled: e.target.checked});
+
+// ---- Calibration target ----
+document.getElementById("target-camera").onclick = () => {
+  document.getElementById("camera-sub").style.display = "block";
+  document.getElementById("imu-sub").style.display = "none";
+  setActive(["target-camera", "target-imu"], "target-camera");
+  post("set_state", {state: "camera_calibration"});
+};
+document.getElementById("target-imu").onclick = () => {
+  document.getElementById("camera-sub").style.display = "none";
+  document.getElementById("imu-sub").style.display = "block";
+  setActive(["target-camera", "target-imu"], "target-imu");
+  post("set_state", {state: "imu_calibration"});
+};
+for (const btn of document.querySelectorAll("#imu-prompt [data-axis]"))
+  btn.onclick = () => post("imu_cal_axis", {axis: Number(btn.dataset.axis)});
+document.getElementById("imu-abort").onclick = () => post("imu_cal_abort");
+
+// ---- Calibration console ----
+let consoleSince = 0;
+let waitingForAnswer = false;
+function consoleLine(text, cls) {
+  const el = document.getElementById("console");
+  const div = document.createElement("div");
+  if (cls) div.className = cls;
+  div.textContent = text;
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
+}
+async function sendLine(line) {
+  if (!line && !waitingForAnswer) return;   // an empty answer (bare Enter) is valid
+  const endpoint = waitingForAnswer ? "/calib/answer" : "/calib/line";
+  await fetch(endpoint, {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({line})});
+}
+document.getElementById("console-send").onclick = () => {
+  const inp = document.getElementById("console-in");
+  const line = inp.value; inp.value = "";
+  sendLine(line);
+};
+document.getElementById("console-in").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") document.getElementById("console-send").click();
+});
+document.getElementById("capture-single").onclick = () => sendLine("capture 1");
+document.getElementById("save-apply").onclick = () => sendLine("save --apply");
+document.getElementById("save-status").onclick = () => sendLine("save status");
+document.getElementById("save-clear").onclick = () => sendLine("save clear");
+document.getElementById("cal-auto").onclick = () => sendLine("cal auto 20");
+document.getElementById("cal-solve").onclick = () => sendLine("cal solve --save");
+document.getElementById("cal-status").onclick = () => sendLine("cal status");
+
+const stepsDiv = document.getElementById("tune-steps");
+for (const step of TUNE_STEPS) {
+  const run = document.createElement("button");
+  run.className = "sm"; run.textContent = step;
+  run.onclick = () => sendLine(`tune ${step} --yes`);
+  stepsDiv.appendChild(run);
+}
+
+async function pollCalib() {
+  try {
+    const r = await fetch(`/calib/output.json?since=${consoleSince}`, {cache:"no-store"});
+    const j = await r.json();
+    consoleSince = j.next;
+    waitingForAnswer = !!j.waiting_for_answer;
+    document.getElementById("console-in").placeholder = waitingForAnswer
+      ? "press Enter (or type q to skip)…" : "calib> help";
+    for (const line of j.lines) consoleLine(line, line.startsWith("calib>") ? "prompt" : "");
+    document.getElementById("calib_img").src = "/calib/live.jpg?v=" + j.live_version;
+  } catch (e) { /* ignore transient errors */ }
+}
+
+// ---- Status polling ----
+function renderImuEvent(evt) {
+  if (!evt || !evt.evt || !evt.evt.startsWith("imu_cal")) return;
+  const idle = document.getElementById("imu-idle"), prompt = document.getElementById("imu-prompt"),
+        report = document.getElementById("imu-report");
+  if (evt.evt === "imu_cal_preview") {
+    idle.style.display = "none"; report.style.display = "none"; prompt.style.display = "block";
+    const g = evt.mean_accel_g || {};
+    document.getElementById("imu-prompt-text").textContent =
+      `${evt.prompt} — mean accel g = (${f(g.x,3)}, ${f(g.y,3)}, ${f(g.z,3)})`;
+  } else if (evt.evt === "imu_cal_report") {
+    prompt.style.display = "none"; report.style.display = "block"; idle.style.display = "none";
+    const b = evt.before, a = evt.after;
+    report.innerHTML = `<p class="muted">FOC run #${evt.foc_run_count}, gravity axis ${evt.gravity_axis}</p>
+      <table style="width:100%;font-size:12.5px"><tr><td></td><td>accel g</td><td>gyro dps</td></tr>
+      <tr><td class="muted">before</td><td>${f(b.accel_g.x,4)}, ${f(b.accel_g.y,4)}, ${f(b.accel_g.z,4)}</td>
+          <td>${f(b.gyro_dps.x,3)}, ${f(b.gyro_dps.y,3)}, ${f(b.gyro_dps.z,3)}</td></tr>
+      <tr><td class="muted">after</td><td>${f(a.accel_g.x,4)}, ${f(a.accel_g.y,4)}, ${f(a.accel_g.z,4)}</td>
+          <td>${f(a.gyro_dps.x,3)}, ${f(a.gyro_dps.y,3)}, ${f(a.gyro_dps.z,3)}</td></tr></table>`;
+  } else if (evt.evt === "imu_cal_aborted" || evt.evt === "imu_cal_failed") {
+    prompt.style.display = "none"; idle.style.display = "block"; report.style.display = "none";
+    idle.textContent = evt.evt === "imu_cal_aborted" ? "Calibration aborted." : `Failed: ${evt.err || ""}`;
+  }
+}
+
+async function poll() {
+  try {
+    const r = await fetch("/status.json", {cache: "no-store"});
+    const j = await r.json();
+    document.getElementById("dot").className = "dot " + (j.device.connected ? "on" : "off");
+    document.getElementById("conn").textContent = j.device.connected ? "device connected" : "waiting for device…";
+    const dev = (j.device && j.device.get_status) || {};
+    document.getElementById("state").textContent = STATE_NAMES[dev.state] || dev.state || "–";
+    document.getElementById("state_lbl").textContent = dev.state ? ("(" + dev.state + ")") : "";
+    document.getElementById("uptime").textContent = dev.uptime_us ? (dev.uptime_us / 1e6).toFixed(0) + " s" : "–";
+    document.getElementById("heap").textContent = kib(dev.heap_free);
+    document.getElementById("psram").textContent = kib(dev.psram_free);
+    const imuAvail = !!dev.imu_available;
+    document.getElementById("imu_avail").textContent = imuAvail ? "available" : "not found";
+    document.getElementById("include_imu").disabled = !imuAvail;
+    document.getElementById("imu_note").textContent = imuAvail ? "" : "(no IMU sensor found on this device)";
+
+    document.getElementById("frame_count").textContent = j.frame_count;
+    document.getElementById("frame_fps").textContent = j.frame_fps;
+    document.getElementById("imu_count").textContent = j.imu_count;
+    document.getElementById("imu_hz").textContent = j.imu_hz;
+    document.getElementById("record").checked = !!j.recording;
+    document.getElementById("bag_uri").textContent = j.recording ? j.bag_uri : "";
+    if (j.stats) {
+      setCpu("cpu0", "cpu0bar", j.stats.cpu0_load);
+      setCpu("cpu1", "cpu1bar", j.stats.cpu1_load);
+      document.getElementById("rssi").textContent = j.stats.wifi_rssi;
+    }
+    if (j.calibration_active) renderImuEvent(j.device.last_event);
+  } catch (e) { /* server momentarily busy */ }
+}
+setInterval(poll, 1000);
+setInterval(pollCalib, 600);
+poll();
+</script>
+</body>
+</html>

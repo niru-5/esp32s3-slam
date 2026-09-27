@@ -209,3 +209,33 @@ def serve_tcp_ingest(host: str, frame_port: int, imu_port: int, stats_port: int,
         t.join(timeout=2.0)
     write_queue.put(None)
     writer.join(timeout=2.0)
+
+
+class TcpIngestManager:
+    """On-demand start/stop wrapper around serve_tcp_ingest() -- host_server/app.py opens
+    these three ports only while STREAM_TCP is the requested mode, closes them on leaving
+    it, instead of binding them for the server's whole lifetime."""
+
+    def __init__(self, host: str, frame_port: int, imu_port: int, stats_port: int,
+                hub: Hub, recorder) -> None:
+        self._args = (host, frame_port, imu_port, stats_port, hub, recorder)
+        self._stop: threading.Event | None = None
+        self._thread: threading.Thread | None = None
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self) -> None:
+        if self.running:
+            return
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=serve_tcp_ingest, args=(*self._args, self._stop), daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if not self.running:
+            return
+        self._stop.set()
+        self._thread.join(timeout=5.0)
+        self._thread = None
