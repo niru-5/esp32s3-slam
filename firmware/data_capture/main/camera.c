@@ -7,6 +7,7 @@
 #include "freertos/queue.h"
 
 #include "config.h"
+#include "camera_overrides.h"
 
 static const char *TAG = "CAM";
 
@@ -77,8 +78,16 @@ esp_err_t camera_init_ex(pixformat_t fmt, framesize_t size, int jpeg_quality,
 }
 
 esp_err_t camera_init(void) {
-    return camera_init_ex(PIXFORMAT_JPEG, FRAMESIZE_SVGA, CONFIG_CAMERA_JPEG_QUALITY_INITIAL,
-                          CONFIG_CAMERA_FB_COUNT, false, false);
+    esp_err_t err = camera_init_ex(PIXFORMAT_JPEG, FRAMESIZE_SVGA, CONFIG_CAMERA_JPEG_QUALITY_INITIAL,
+                                   CONFIG_CAMERA_FB_COUNT, false, false);
+    if (err != ESP_OK) return err;
+    // Re-apply any NVS-persisted register overrides from a previous calibration
+    // session (see camera_overrides.h) -- deliberately only here, not in
+    // camera_init_ex(), so a live calibration/tuning session (which reinits via
+    // camera_init_ex directly) never gets its own half-tuned experiment
+    // clobbered by a previously-saved set.
+    camera_overrides_apply();
+    return ESP_OK;
 }
 
 void camera_release(camera_fb_t *fb) {

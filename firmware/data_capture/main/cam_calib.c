@@ -15,6 +15,7 @@
 
 #include "config.h"
 #include "camera.h"
+#include "camera_overrides.h"
 
 static const char *TAG = "CAMCAL";
 
@@ -397,6 +398,62 @@ static esp_err_t cmd_capture(int id, const cJSON *req) {
     return send_jsonf("{\"id\":%d,\"ok\":true,\"captured\":%d}", id, captured);
 }
 
+// --------------------------------------------------------------------------
+// Persisted register overrides (camera_overrides.h) -- "save tuned registers"
+// half of the workflow. The host computes *what* is safe to persist (see
+// software/host_server/calibration/registers.py RegisterBank.save_candidates,
+// which reuses the same UNSAFE_RESTORE/volatile() filtering `restore` already
+// applies) and sends the final list here; this module just stores/applies it.
+// --------------------------------------------------------------------------
+
+// {"writes":[{"a":addr,"v":val}, ...]}
+static esp_err_t cmd_save_camera_regs(int id, const cJSON *req) {
+    const cJSON *writes = cJSON_GetObjectItemCaseSensitive(req, "writes");
+    if (!cJSON_IsArray(writes)) return reply_err(id, "missing writes[]");
+    int n = cJSON_GetArraySize(writes);
+    if (n < 1) return reply_err(id, "writes[] must be non-empty");
+
+    camera_override_write_t *buf = malloc((size_t)n * sizeof(camera_override_write_t));
+    if (!buf) return reply_err(id, "oom");
+    int i = 0;
+    const cJSON *w;
+    cJSON_ArrayForEach(w, writes) {
+        int a, v;
+        if (!json_int(w, "a", &a) || !json_int(w, "v", &v)) { free(buf); return reply_err(id, "bad write entry"); }
+        buf[i].addr = (uint16_t)a;
+        buf[i].val  = (uint8_t)v;
+        i++;
+    }
+    esp_err_t err = camera_overrides_save(buf, (size_t)i);
+    free(buf);
+    if (err == ESP_ERR_NO_MEM)
+        return send_jsonf("{\"id\":%d,\"ok\":false,\"err\":\"too many saved registers (limit %d total)\"}",
+                          id, CAMERA_OVERRIDES_MAX_REGS);
+    if (err != ESP_OK) return reply_err(id, "save failed");
+
+    camera_override_write_t saved[CAMERA_OVERRIDES_MAX_REGS];
+    size_t total = camera_overrides_get(saved, CAMERA_OVERRIDES_MAX_REGS);
+    return send_jsonf("{\"id\":%d,\"ok\":true,\"saved_this_call\":%d,\"total_saved\":%u}", id, i, (unsigned)total);
+}
+
+static esp_err_t cmd_clear_camera_regs(int id) {
+    esp_err_t err = camera_overrides_clear();
+    if (err != ESP_OK) return reply_err(id, "clear failed");
+    return send_jsonf("{\"id\":%d,\"ok\":true}", id);
+}
+
+static esp_err_t cmd_get_camera_overrides(int id) {
+    camera_override_write_t regs[CAMERA_OVERRIDES_MAX_REGS];
+    size_t count = camera_overrides_get(regs, CAMERA_OVERRIDES_MAX_REGS);
+    if (count > CAMERA_OVERRIDES_MAX_REGS) count = CAMERA_OVERRIDES_MAX_REGS;  // get() may report more than it copied
+    int off = snprintf((char *)s_tx + 5, TX_BUF_LEN - 5, "{\"id\":%d,\"ok\":true,\"regs\":[", id);
+    for (size_t i = 0; i < count; i++)
+        off += snprintf((char *)s_tx + 5 + off, TX_BUF_LEN - 5 - off, "%s{\"a\":%d,\"v\":%d}",
+                        i ? "," : "", regs[i].addr, regs[i].val);
+    off += snprintf((char *)s_tx + 5 + off, TX_BUF_LEN - 5 - off, "]}");
+    return send_built_json((size_t)off);
+}
+
 // Returns ESP_OK to keep going, ESP_ERR_NOT_FINISHED when the host asked to exit,
 // anything else on a link error.
 static esp_err_t handle_command(const uint8_t *body, size_t len) {
@@ -415,6 +472,9 @@ static esp_err_t handle_command(const uint8_t *body, size_t len) {
     else if (!strcmp(cmd, "fps_probe")) err = cmd_fps_probe(id, req);
     else if (!strcmp(cmd, "set_orientation")) err = cmd_set_orientation(id, req);
     else if (!strcmp(cmd, "capture"))   err = cmd_capture(id, req);
+    else if (!strcmp(cmd, "save_camera_regs"))    err = cmd_save_camera_regs(id, req);
+    else if (!strcmp(cmd, "clear_camera_regs"))   err = cmd_clear_camera_regs(id);
+    else if (!strcmp(cmd, "get_camera_overrides")) err = cmd_get_camera_overrides(id);
     else if (!strcmp(cmd, "exit")) {
         send_jsonf("{\"id\":%d,\"ok\":true}", id);
         err = ESP_ERR_NOT_FINISHED;

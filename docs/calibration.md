@@ -3,19 +3,24 @@
 ## IMU bias/offset calibration (implemented)
 
 Triggered by console command `4` on `data_capture` (`APP_STATE_IMU_CALIBRATION`,
-`state_machine.c:imu_calibration_run()`), which calls
-`imu_run_hw_foc_calibration()` (`firmware/data_capture/main/imu.c`). Procedure:
+`state_machine.c:imu_calibration_run()`) — or, without a serial cable, `set_state
+imu_calibration` from `software/host_server/control`'s browser page, over the always-on
+control channel (`control_link.c`; see `docs/architecture.md` "Control channel"). Either way
+it calls `imu_run_hw_foc_calibration()` (`firmware/data_capture/main/imu.c`). Procedure:
 
 1. **Guided gravity-axis selection** (`state_machine.c:select_gravity_axis()`).
    `bmi2_perform_accel_foc` has no way to detect the rig's orientation itself
    — it needs to be told which axis (and sign) gravity is aligned with, and
-   computes whatever offset makes *that* axis read exactly ±1g. So the
-   console prints 10 raw accel+gyro samples over ~100ms, tells the operator
-   whichever axis reads closest to ±1.0 is the one gravity is aligned with,
-   and blocks for one digit (`1`=+X `2`=-X `3`=+Y `4`=-Y `5`=+Z `6`=-Z,
-   anything else aborts before touching the chip). Get this wrong and FOC
-   still "succeeds" — it just bakes in the wrong bias, silently, since the
-   chip has no independent way to check the claimed orientation.
+   computes whatever offset makes *that* axis read exactly ±1g. So the device
+   samples 10 raw accel+gyro samples over ~100ms and prints (over serial) /
+   sends (as an `imu_cal_preview` event over the control link, for the
+   browser's axis-picker buttons) whichever axis reads closest to ±1.0 as the
+   one gravity is aligned with, then blocks for one answer from *either*
+   source (`1`=+X `2`=-X `3`=+Y `4`=-Y `5`=+Z `6`=-Z, anything else aborts
+   before touching the chip; `wait_for_operator_digit()` in
+   `state_machine.c`). Get this wrong and FOC still "succeeds" — it just
+   bakes in the wrong bias, silently, since the chip has no independent way
+   to check the claimed orientation.
 2. Capture ~`CONFIG_IMU_CALIBRATION_WINDOW_MS` of stationary samples (direct
    BMI270 polls, bypassing the streaming pipeline) and compute per-axis
    mean/stddev — the "before" snapshot. Stddev is a stationarity check: large
@@ -82,18 +87,12 @@ camera_calibration) rather than reinventing them on-device.
 - Multi-position/tumble accelerometer calibration (scale + misalignment, not
   just bias) if FOC-only bias turns out insufficient for SLAM accuracy.
 
-## Camera calibration
-
-Not started. `firmware/camera_calibration/` currently holds only target PDFs
-(ChArUco/circles/Kalibr boards); `APP_STATE_CAMERA_CALIBRATION` in
-`state_machine.c` remains a stub. Plan is to use existing tooling (Kalibr or
-ROS `camera_calibration`) against captured frames rather than implementing
-calibration logic on-device.
-
-
 ## Camera calibration and ISP tuning (implemented)
 
 Checkerboard intrinsics (burst/auto capture with on-the-fly solve, offline re-solve) and the ten
 OV5640 tuning steps from the playbook are driven from the host with
-`python -m host_server.calibration run` while the device is in `CAMERA_CALIBRATION` (console
-command `5`). See [camera_calibration_and_tuning.md](camera_calibration_and_tuning.md).
+`python -m host_server.calibration run` while the device is in `CAMERA_CALIBRATION` (entered via
+serial command `5`, or `set_state camera_calibration` over the control channel — see
+`docs/architecture.md` "Control channel"). Tuned registers can be persisted to the device (NVS,
+survives reboot) with `cli.py`'s `save` command. See
+[camera_calibration_and_tuning.md](camera_calibration_and_tuning.md).

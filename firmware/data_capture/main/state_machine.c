@@ -6,6 +6,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
 
@@ -17,11 +18,21 @@
 #include "tcp_client.h"
 #include "sdcard.h"
 #include "cam_calib.h"
+#include "control_link.h"
 
 static const char *TAG = "STATE";
 
 static app_state_t s_state             = APP_STATE_IDLE;
 static bool        s_sdcard_available  = false;
+
+// Second command source (control_link.c) -- see state_machine.h. s_cmd_queue
+// carries synthetic serial-digit-equivalent commands; s_imu_answer_queue
+// carries the IMU-calibration gravity-axis answer, gated by
+// s_imu_axis_wait_active so a stray/late imu_cal_axis command outside the
+// actual prompt window is rejected rather than silently swallowed.
+static QueueHandle_t   s_cmd_queue          = NULL;
+static QueueHandle_t   s_imu_answer_queue   = NULL;
+static volatile bool   s_imu_axis_wait_active = false;
 
 // --------------------------------------------------------------------------
 // IMU calibration — hardware bias/offset only (BMI270 FOC + NVM commit, see
@@ -39,19 +50,26 @@ static bool        s_sdcard_available  = false;
 // docs/calibration.md. Camera calibration lives in cam_calib.c.
 // --------------------------------------------------------------------------
 
-// Block until the operator sends one non-blank byte, reusing the same
-// non-blocking stdin main_state_machine_task already configured. '\n'/'\r'
-// are skipped rather than treated as an answer -- the command that got us
-// here (e.g. "4\n" from a line-buffered terminal) can leave one buffered,
-// and without this it would be misread as the operator's answer before they
+// Block until the operator sends one non-blank byte, from *either* the
+// serial console (non-blocking stdin, same as main_state_machine_task's own
+// polling) or the control link (control_link.c's imu_cal_axis, delivered via
+// s_imu_answer_queue) -- whichever arrives first. '\n'/'\r' from serial are
+// skipped rather than treated as an answer -- the command that got us here
+// (e.g. "4\n" from a line-buffered terminal) can leave one buffered, and
+// without this it would be misread as the operator's answer before they
 // ever see the prompt.
-static int wait_for_console_digit(void) {
+static int wait_for_operator_digit(void) {
     int c;
     while (1) {
         c = fgetc(stdin);
-        if (c == EOF) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
-        if (c == '\n' || c == '\r') continue;
-        return c;
+        if (c != EOF) {
+            if (c == '\n' || c == '\r') continue;
+            return c;
+        }
+        char qc;
+        if (s_imu_answer_queue && xQueueReceive(s_imu_answer_queue, &qc, 0) == pdTRUE)
+            return (int)qc;
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -80,9 +98,21 @@ static bool select_gravity_axis(imu_accel_foc_axis_t *out) {
     ESP_LOGI(TAG, "Select that axis+sign: 1=+X 2=-X 3=+Y 4=-Y 5=+Z 6=-Z  (anything else aborts)");
     ESP_LOGI(TAG, "Send one digit now:");
 
-    int c = wait_for_console_digit();
+    // Mirror the same prompt over the control link (no-op if nothing's connected
+    // there) so a host UI can render the same axis picker instead of a serial
+    // terminal -- see control_link.h and imu_cal_axis/imu_cal_abort.
+    control_link_send_event(
+        "{\"evt\":\"imu_cal_preview\","
+        "\"prompt\":\"pick axis: 1=+X 2=-X 3=+Y 4=-Y 5=+Z 6=-Z (anything else aborts)\","
+        "\"mean_accel_g\":{\"x\":%.4f,\"y\":%.4f,\"z\":%.4f}}",
+        (double)(ax_sum / 10), (double)(ay_sum / 10), (double)(az_sum / 10));
+
+    s_imu_axis_wait_active = true;
+    int c = wait_for_operator_digit();
+    s_imu_axis_wait_active = false;
     if (c < '1' || c > '6') {
         ESP_LOGW(TAG, "calibration aborted (got 0x%02x, expected 1-6)", (unsigned)c);
+        control_link_send_event("{\"evt\":\"imu_cal_aborted\"}");
         return false;
     }
     *out = (imu_accel_foc_axis_t)(c - '0');
@@ -109,6 +139,7 @@ static void imu_calibration_run(void) {
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "IMU calibration failed or NVM commit didn't stick (err=%s) — see log above",
                  esp_err_to_name(err));
+        control_link_send_event("{\"evt\":\"imu_cal_failed\",\"err\":\"%s\"}", esp_err_to_name(err));
         return;
     }
 
@@ -154,6 +185,23 @@ static void imu_calibration_run(void) {
     } else {
         ESP_LOGW(TAG, "SD card unavailable — calibration report only in the serial log above");
     }
+
+    // Structured event mirroring the report above for a host UI -- the free-text
+    // `report` itself isn't sent as-is (it's built for a log line, not escaped
+    // for JSON); these are the same before/after numbers in field form.
+    control_link_send_event(
+        "{\"evt\":\"imu_cal_report\",\"foc_run_count\":%lu,\"gravity_axis\":\"%s\","
+        "\"before\":{\"n\":%lu,\"accel_g\":{\"x\":%.5f,\"y\":%.5f,\"z\":%.5f},"
+                   "\"gyro_dps\":{\"x\":%.5f,\"y\":%.5f,\"z\":%.5f}},"
+        "\"after\":{\"n\":%lu,\"accel_g\":{\"x\":%.5f,\"y\":%.5f,\"z\":%.5f},"
+                  "\"gyro_dps\":{\"x\":%.5f,\"y\":%.5f,\"z\":%.5f}}}",
+        (unsigned long)foc_run_count, imu_accel_foc_axis_label(gravity_axis),
+        (unsigned long)before.sample_count,
+        (double)before.ax_mean, (double)before.ay_mean, (double)before.az_mean,
+        (double)before.gx_mean, (double)before.gy_mean, (double)before.gz_mean,
+        (unsigned long)after.sample_count,
+        (double)after.ax_mean, (double)after.ay_mean, (double)after.az_mean,
+        (double)after.gx_mean, (double)after.gy_mean, (double)after.gz_mean);
 }
 
 // --------------------------------------------------------------------------
@@ -316,12 +364,16 @@ static void main_state_machine_task(void *arg) {
     int flags = fcntl(fileno(stdin), F_GETFL, 0);
     fcntl(fileno(stdin), F_SETFL, flags | O_NONBLOCK);
 
-    ESP_LOGI(TAG, "ready — send 1=wifi 2=sdcard 3=stop 4=imu_cal 5=cam_cal 6=tcp");
+    ESP_LOGI(TAG, "ready — send 1=wifi 2=sdcard 3=stop 4=imu_cal 5=cam_cal 6=tcp "
+                  "(same commands also accepted over the control link, see control_link.h)");
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(CONFIG_STATE_MACHINE_POLL_MS));
         int c;
         while ((c = fgetc(stdin)) != EOF)
             handle_command((char)c);
+        char qc;
+        while (xQueueReceive(s_cmd_queue, &qc, 0) == pdTRUE)
+            handle_command(qc);
         if (s_state == APP_STATE_CAMERA_CALIBRATION && !cam_calib_active()) {
             s_state = APP_STATE_IDLE;
             ESP_LOGI(TAG, "camera calibration finished -> IDLE");
@@ -334,10 +386,41 @@ esp_err_t state_machine_start(bool sdcard_available) {
     if (!s_sdcard_available)
         ESP_LOGW(TAG, "SD card unavailable — command 2 (STREAM_SDCARD) will be rejected");
 
+    s_cmd_queue = xQueueCreate(8, sizeof(char));
+    s_imu_answer_queue = xQueueCreate(1, sizeof(char));
+    if (!s_cmd_queue || !s_imu_answer_queue) return ESP_ERR_NO_MEM;
+
     if (xTaskCreatePinnedToCore(main_state_machine_task, "state_machine",
                                 CONFIG_STATE_MACHINE_TASK_STACK_SIZE, NULL,
                                 CONFIG_STATE_MACHINE_TASK_PRIORITY, NULL,
                                 CONFIG_STATE_MACHINE_TASK_CORE) != pdPASS)
         return ESP_ERR_NO_MEM;
     return ESP_OK;
+}
+
+esp_err_t state_machine_post_command(char c) {
+    if (!s_cmd_queue) return ESP_ERR_INVALID_STATE;
+    return xQueueSend(s_cmd_queue, &c, 0) == pdTRUE ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+bool state_machine_post_imu_axis(char c) {
+    if (!s_imu_axis_wait_active || !s_imu_answer_queue) return false;
+    xQueueOverwrite(s_imu_answer_queue, &c);
+    return true;
+}
+
+app_state_t state_machine_get_state(void) {
+    return s_state;
+}
+
+const char *state_machine_state_name(app_state_t s) {
+    switch (s) {
+    case APP_STATE_IDLE:               return "idle";
+    case APP_STATE_STREAM_WIFI:        return "stream_wifi";
+    case APP_STATE_STREAM_SDCARD:      return "stream_sdcard";
+    case APP_STATE_IMU_CALIBRATION:    return "imu_calibration";
+    case APP_STATE_CAMERA_CALIBRATION: return "camera_calibration";
+    case APP_STATE_STREAM_TCP:         return "stream_tcp";
+    default:                           return "unknown";
+    }
 }

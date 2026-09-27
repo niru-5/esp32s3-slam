@@ -46,3 +46,33 @@ typedef enum {
 // the result of sdcard_init() (or false if CONFIG_USE_SDCARD is off) --
 // command 2 (STREAM_SDCARD) is rejected when false.
 esp_err_t state_machine_start(bool sdcard_available);
+
+// --------------------------------------------------------------------------
+// Second command source: control_link.c (the always-on host control
+// channel, see control_link.h). Both this and the serial console funnel
+// into the exact same handle_command()/enter_*() transition functions --
+// these just get a synthetic command into the queue main_state_machine_task
+// already drains every CONFIG_STATE_MACHINE_POLL_MS.
+// --------------------------------------------------------------------------
+
+// Post one command byte, same encoding as a serial digit ('1'-'6'). Returns
+// ESP_ERR_NO_MEM if the (8-deep) queue is full -- essentially unreachable at
+// the rate a host UI would send these.
+esp_err_t state_machine_post_command(char c);
+
+// Answer the IMU-calibration gravity-axis prompt (state_machine.c
+// select_gravity_axis()) from the control link instead of the serial
+// console. Returns false if nothing is currently waiting for an answer
+// (state isn't APP_STATE_IMU_CALIBRATION, or the prompt already got an
+// answer) -- the caller should surface that as an error, not retry silently.
+bool state_machine_post_imu_axis(char c);
+
+// Best-effort snapshot of the current state, for control_link.c's
+// get_status. Not mutex-guarded (s_state is a single aligned word written
+// from exactly one task) -- same "eventually consistent" spirit as every
+// other cross-task status read in this codebase.
+app_state_t state_machine_get_state(void);
+
+// Name matching what control_link.c's set_state command accepts, e.g.
+// "stream_wifi". "unknown" for any value outside app_state_t's range.
+const char *state_machine_state_name(app_state_t s);

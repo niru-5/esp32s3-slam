@@ -11,6 +11,8 @@ idf_component_register(
         "sdcard.c"
         "state_machine.c"
         "cam_calib.c"
+        "camera_overrides.c"
+        "control_link.c"
         "${BMI_API}/bmi2.c"
         "${BMI_API}/bmi270.c"
     INCLUDE_DIRS

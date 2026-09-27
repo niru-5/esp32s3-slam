@@ -24,7 +24,7 @@ from . import intrinsics as ix
 from .flow import IntrinsicFlow, solve_offline
 from .link import DeviceLink, LinkError
 from .liveview import LiveView
-from .registers import RegisterBank, RegisterError, diff_dumps, load_dump, save_dump
+from .registers import RegisterBank, RegisterError, UNSAFE_RESTORE, diff_dumps, load_dump, save_dump
 from .session import Session, decode, default_root
 
 HELP = """\
@@ -54,6 +54,11 @@ tuning (see docs/camera_calibration_and_tuning.md)
   tune                          list steps
   tune <step> [--yes] [--keep]  run a step: backup -> instructions -> variants -> analysis
   tune notes <step>             show what a step does and what to expect
+persistence (see docs/camera_calibration_and_tuning.md "Persisting tuned registers")
+  save [--apply]                show/apply: persist this session's register writes (regw/freeze/
+                                 orient's undo log) to the device's NVS -- survives a reboot
+  save status                   show what's currently saved on the device
+  save clear                    erase saved overrides (defaults return after next camera_init())
 session
   view                          print the live-view URL
   exit                          leave calibration mode on the device (restores streaming camera config)
@@ -268,6 +273,56 @@ class App:
     def do_view(self, a):
         self.out(f"live view: http://localhost:{self.view_port}/")
 
+    def do_save(self, a):
+        """save [--apply] | save status | save clear -- see docs/camera_calibration_and_tuning.md
+        "Persisting tuned registers". Builds the write-list from this session's own undo log
+        (every regw/freeze/orient write, deduped to the last value per address) rather than
+        diffing against a baseline -- it's already exactly the set of registers this session
+        intentionally changed."""
+        if a and a[0] == "status":
+            r = self.link.call("get_camera_overrides")
+            if not r.ok:
+                raise RegisterError(r.data.get("err", "get_camera_overrides failed"))
+            regs = r.data.get("regs", [])
+            if not regs:
+                self.out("no register overrides currently saved on the device")
+                return
+            self.out(f"{len(regs)} register override(s) currently saved:")
+            for reg in sorted(regs, key=lambda d: d["a"]):
+                self.out(f"  0x{reg['a']:04X} = 0x{reg['v']:02X}")
+            return
+        if a and a[0] == "clear":
+            r = self.link.call("clear_camera_regs")
+            if not r.ok:
+                raise RegisterError(r.data.get("err", "clear_camera_regs failed"))
+            self.out("cleared saved register overrides -- defaults return after the next "
+                     "camera_init() (e.g. `exit` or a reboot)")
+            self.session.log("clear_camera_regs")
+            return
+
+        last: dict[int, int] = {}
+        for addr, _old, new in self.regs.undo_log:
+            last[addr] = new
+        writes = sorted((addr, v) for addr, v in last.items() if addr not in UNSAFE_RESTORE)
+        skipped = len(last) - len(writes)
+        if not writes:
+            self.out("nothing to save -- no (safe) register writes made this session "
+                     "(see `regw`/`freeze`/`orient`)" + (f", {skipped} skipped as unsafe" if skipped else ""))
+            return
+        if "--apply" not in a:
+            self.out(f"would save {len(writes)} register(s) to device NVS"
+                     + (f" ({skipped} skipped as unsafe)" if skipped else "") + ":")
+            for addr, v in writes:
+                self.out(f"  0x{addr:04X} = 0x{v:02X}")
+            self.out("re-run as `save --apply` to persist (survives reboot)")
+            return
+        r = self.link.call("save_camera_regs", writes=[{"a": addr, "v": v} for addr, v in writes])
+        if not r.ok:
+            raise RegisterError(r.data.get("err", "save_camera_regs failed"))
+        self.out(f"saved {r.data['saved_this_call']} register(s) this call, "
+                 f"{r.data['total_saved']} total persisted on the device")
+        self.session.log("save_camera_regs", writes=len(writes))
+
     def do_exit(self, a):
         try:
             self.link.call("exit", timeout=10)
@@ -306,6 +361,33 @@ def _enter_mode_over_serial(port: str, out) -> tuple:
     return s, (m.group(1).decode() if m else None)
 
 
+def _request_calibration_via_control(base_url: str, out) -> bool:
+    """Ask an already-running `host_server.control` app (see software/host_server/control) to
+    flip the device into camera_calibration over the always-on control channel, instead of
+    needing a serial cable. Best-effort: returns False (never raises) if nothing's listening
+    there, or the device isn't reachable through it yet -- the caller falls back to assuming
+    the device is already in calibration mode (or to --serial)."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    payload = _json.dumps({"cmd": "set_state", "state": "camera_calibration"}).encode()
+    req = urllib.request.Request(base_url.rstrip("/") + "/command", data=payload,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = _json.loads(resp.read())
+    except (OSError, urllib.error.URLError) as exc:
+        out(f"  (control app not reachable at {base_url}: {exc} -- assuming the device is "
+            f"already in calibration mode, or pass --serial)")
+        return False
+    if not data.get("ok"):
+        out(f"  control app at {base_url} rejected the request: {data.get('err')}")
+        return False
+    out(f"  requested camera_calibration via the control app at {base_url}")
+    return True
+
+
 def _tee_serial(ser, path: Path) -> None:
     """Keep draining the console into <session>/device.log (firmware ESP_LOG output)."""
     import threading
@@ -331,6 +413,8 @@ def cmd_run(args) -> int:
     ser = None
     if args.serial:
         ser, _ = _enter_mode_over_serial(args.serial, print)
+    elif not args.no_control:
+        _request_calibration_via_control(args.control_http, print)
     try:
         hello = link.wait_for_device(args.wait, on_wait=lambda: print(
             "  ... waiting for the device to connect (put it in camera calibration mode: serial command 5)"))
@@ -406,6 +490,11 @@ def main(argv=None) -> int:
     r.add_argument("--port", type=int, default=8084, help="control port to listen on (CONFIG_CAM_CALIB_PORT)")
     r.add_argument("--view-port", type=int, default=8090)
     r.add_argument("--serial", help="serial port: send '5' to put the device in calibration mode")
+    r.add_argument("--control-http", default="http://localhost:8091",
+                   help="host_server.control app to request camera_calibration through, if --serial "
+                        "isn't given and one happens to be running (default: %(default)s)")
+    r.add_argument("--no-control", action="store_true",
+                   help="don't try --control-http; assume the device is already in calibration mode")
     r.add_argument("--wait", type=float, default=90.0, help="seconds to wait for the device to start listening")
     r.add_argument("--out", help=f"session root (default {default_root()})")
     r.add_argument("--name", help="session folder name (default: timestamp)")

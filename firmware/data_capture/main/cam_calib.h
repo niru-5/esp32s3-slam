@@ -11,8 +11,9 @@
 // software/host_server/calibration is listening, and reconnecting if the link drops) and
 // then obeys commands from it:
 // capture N frames (with per-frame metadata), read/write/dump sensor registers,
-// switch pixel format / resolution (incl. RAW8), exit. Everything on one
-// persistent socket, framed as
+// switch pixel format / resolution (incl. RAW8), persist/clear/inspect a saved
+// register override set (save_camera_regs/clear_camera_regs/get_camera_overrides
+// -- see camera_overrides.h), exit. Everything on one persistent socket, framed as
 //
 //     uint32 len (LE) | uint8 type | body[len-1]
 //

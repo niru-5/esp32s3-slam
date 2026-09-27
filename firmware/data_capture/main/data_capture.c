@@ -14,6 +14,7 @@
 #include "sysstats.h"
 #include "sdcard.h"
 #include "state_machine.h"
+#include "control_link.h"
 
 static const char *TAG = "SLAM";
 
@@ -97,8 +98,9 @@ static void sync_time(void) {
 // --------------------------------------------------------------------------
 // Entry point — brings up WiFi + the camera/IMU/SD hardware once, then hands
 // off to main_state_machine_task, which creates/tears down the actual
-// capture pipelines at runtime based on serial commands (see
-// docs/architecture.md "Runtime state machine").
+// capture pipelines at runtime based on commands from either the serial
+// console or the always-on control channel (control_link.c) -- see
+// docs/architecture.md "Runtime state machine".
 // --------------------------------------------------------------------------
 
 void app_main(void) {
@@ -130,4 +132,11 @@ void app_main(void) {
 #endif
 
     state_machine_start(sdcard_available);
+
+    // Always-on host control channel (browser UI mode toggle + host-driven IMU
+    // calibration, see control_link.h) -- independent of app_state_t, unlike
+    // every pipeline above. Best-effort: a failure here still leaves the rig
+    // fully controllable over serial.
+    if (control_link_start() != ESP_OK)
+        ESP_LOGW(TAG, "control_link_start() failed — host control channel unavailable (serial still works)");
 }

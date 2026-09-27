@@ -3,11 +3,14 @@
 // --------------------------------------------------------------------------
 // Build-time configuration for the data_capture app.
 //
-// Runtime behaviour is driven by main_state_machine_task (serial commands
-// 1-5 select IDLE / STREAM_WIFI / STREAM_SDCARD / IMU_CALIBRATION /
-// CAMERA_CALIBRATION) — see docs/architecture.md for the full design. This
-// file holds every tunable the state machine and its producer/consumer/stats
-// tasks read: task priorities, core pinning, periods, and queue depths.
+// Runtime behaviour is driven by main_state_machine_task, fed by two command
+// sources: serial digits 1-6 (IDLE / STREAM_WIFI / STREAM_SDCARD /
+// IMU_CALIBRATION / CAMERA_CALIBRATION / STREAM_TCP) and the same set_state
+// commands over the always-on control channel (control_link.c,
+// CONFIG_CONTROL_PORT below) that the host control UI drives — see
+// docs/architecture.md for the full design. This file holds every tunable
+// the state machine and its producer/consumer/stats tasks read: task
+// priorities, core pinning, periods, and queue depths.
 // --------------------------------------------------------------------------
 
 // --------------------------------------------------------------------------
@@ -87,7 +90,20 @@
 
 // CAMERA_CALIBRATION mode (cam_calib.c): the device dials CONFIG_REMOTE_HOST on this port and
 // takes commands from the host tool (software/host_server/calibration) over that connection.
+// Unchanged by the host-control rework below: this stays a dedicated, mode-scoped socket so
+// software/host_server/calibration/cli.py keeps working exactly as it does today.
 #define CONFIG_CAM_CALIB_PORT 8084
+
+// Always-on device control channel (control_link.c): the device dials CONFIG_REMOTE_HOST on
+// this port at boot and keeps reconnecting for the rest of its runtime, independent of
+// app_state_t. Carries get_status/set_state (host-driven mode switching -- the same
+// transitions serial commands 1-6 trigger) and the host-driven IMU calibration flow
+// (imu_cal_axis/imu_cal_abort, imu_cal_preview/imu_cal_report events). Deliberately a
+// separate port from CONFIG_CAM_CALIB_PORT: that one is only ever bound by one calibration
+// session at a time (cli.py, interactively); this one is meant to have a host-side listener
+// (software/host_server/control) running continuously, so the two must not contend for the
+// same TCP port. See docs/camera_calibration_and_tuning.md "Control channel".
+#define CONFIG_CONTROL_PORT 8085
 
 // --------------------------------------------------------------------------
 // main_state_machine_task — owns the IDLE/STREAM_WIFI/STREAM_SDCARD/
