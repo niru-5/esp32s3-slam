@@ -10,6 +10,7 @@ docs/camera_calibration_and_tuning.md "Tests").
 from __future__ import annotations
 
 import json
+import threading
 import time
 import unittest
 import urllib.error
@@ -153,6 +154,35 @@ class ServerWithFakeDevice(unittest.TestCase):
         self.assertTrue(self.state.tcp.running)
         _post(self.http_port, "/command", {"cmd": "set_state", "state": "idle"})
         self.assertFalse(self.state.tcp.running)
+
+    def test_concurrent_enter_builds_exactly_one_session(self):
+        """Regression test for a race found on real hardware: CalibrationManager.enter()'s
+        body includes App.startup_backup()'s ~9s reg_dump, so the naive "if active: return"
+        guard left a wide check-then-act window where two callers (the HTTP handler thread
+        driving a just-issued set_state, and the background poller, which independently
+        notices camera_calibration too) could both pass the guard and each build their own
+        Session/App -- console commands submitted in between landed on whichever instance
+        happened to be `self.calib.console` at that moment, silently splitting one operator
+        session across two orphaned ones. Slow the fake device's reg_dump down to widen the
+        window reliably instead of relying on real hardware's ~9s to hit it by chance."""
+        self.dev.reg_dump_delay = 0.3
+        barrier = threading.Barrier(2)
+        results: list = []
+
+        def enter_once():
+            barrier.wait(timeout=5)
+            self.state.calib.enter()
+            results.append(self.state.calib.session)
+
+        threads = [threading.Thread(target=enter_once) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        self.assertEqual(len(results), 2)
+        self.assertIsNotNone(results[0])
+        self.assertIs(results[0], results[1], "two concurrent enter() calls built two different sessions")
 
     def test_imu_event_surfaced_in_status(self):
         self.dev.send_event({"evt": "imu_cal_preview", "prompt": "pick axis",

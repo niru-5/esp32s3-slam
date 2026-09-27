@@ -15,6 +15,7 @@ import json
 import socket
 import struct
 import threading
+import time
 
 _LEN = struct.Struct("<I")
 _MSG_JSON = 0x01
@@ -22,9 +23,14 @@ _MSG_IMAGE = 0x02
 
 
 class FakeControlDevice:
-    def __init__(self, port: int, state: str = "idle", imu_available: bool = False):
+    def __init__(self, port: int, state: str = "idle", imu_available: bool = False,
+                reg_dump_delay: float = 0.0):
         self.state = state
         self.imu_available = imu_available
+        # Artificial per-call delay before answering reg_dump -- widens the window for
+        # tests that need to reliably provoke a race around App.startup_backup()'s ~9s
+        # real-hardware reg_dump (see test_control.py's concurrent-enter() regression test).
+        self.reg_dump_delay = reg_dump_delay
         self.received: list[dict] = []
         self.saved_overrides: dict[int, int] = {}
         self._seq = 0
@@ -107,6 +113,8 @@ class FakeControlDevice:
             results = [{"a": w["a"], "old": 0, "new": w["v"], "rc": 0} for w in req.get("writes", [])]
             self._send({"id": rid, "ok": True, "results": results})
         elif cmd == "reg_dump":
+            if self.reg_dump_delay:
+                time.sleep(self.reg_dump_delay)
             total = 0
             for a, b in req.get("ranges", []):
                 for start in range(a, b + 1, 256):

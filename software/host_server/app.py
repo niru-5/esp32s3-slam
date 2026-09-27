@@ -59,7 +59,20 @@ _STREAM_STATES = {"stream_wifi", "stream_sdcard", "stream_tcp"}
 class CalibrationManager:
     """Owns the one calibration Session/App/CalibrationConsole, live for as long as the
     device is in camera_calibration. Created on entering that state, destroyed on leaving
-    it -- see Server._on_set_state()."""
+    it -- see Server._set_state() and Server._poll_loop().
+
+    enter()/leave() are called from at least two threads that can both observe "not active"
+    at once: the HTTP handler thread driving a just-issued set_state, and the background
+    poller (which independently notices camera_calibration from serial-triggered entry, or
+    session teardown from the console's own `exit`). `enter()`'s own body includes
+    App.startup_backup()'s ~9 s full register dump, so the naive `if self.active: return`
+    guard left a wide check-then-act window open for real: verified on hardware -- both
+    threads passed the guard, each built its own Session/App (each doing its own ~9 s
+    backup, serialized behind DeviceSession's one-call-at-a-time lock), and console commands
+    submitted in between landed on whichever instance happened to currently be
+    `self.console` at request time, splitting a single operator session across two orphaned
+    ones. `_lock` makes the whole check-and-build atomic instead.
+    """
 
     def __init__(self, device: DeviceSession, out_root: Path | None = None):
         self.device = device
@@ -68,12 +81,17 @@ class CalibrationManager:
         self.console: CalibrationConsole | None = None
         self.view: LiveView | None = None
         self.board = ix.Board(9, 6, 25.0)
+        self._lock = threading.Lock()
 
     @property
     def active(self) -> bool:
         return self.console is not None
 
     def enter(self) -> None:
+        with self._lock:
+            self._enter_locked()
+
+    def _enter_locked(self) -> None:
         if self.active:
             return
         self.session = Session(self.out_root or default_root())
@@ -91,11 +109,12 @@ class CalibrationManager:
         self.console = CalibrationConsole(factory)
 
     def leave(self) -> None:
-        if self.console is not None:
-            self.console.close()
-        self.console = None
-        self.session = None
-        self.view = None
+        with self._lock:
+            if self.console is not None:
+                self.console.close()
+            self.console = None
+            self.session = None
+            self.view = None
 
 
 class Server:
@@ -121,6 +140,17 @@ class Server:
         self._poll_thread.start()
 
     def _poll_loop(self) -> None:
+        # Calibration-console lifecycle only -- NOT tcp.stop()/tcp.start(): a state read here
+        # can legitimately lag the host's own just-issued request for up to
+        # CONFIG_STATE_MACHINE_POLL_MS (the device hasn't drained its queued transition yet).
+        # Tried tearing down stream_tcp's ports here too on "st != stream_tcp" and it raced
+        # exactly that lag on real hardware -- _set_state() had *just* opened them, this loop
+        # read the device's still-stale get_status one tick later, and closed them again
+        # before the device's own tcp_client.c ever got a chance to connect. set_state's own
+        # handler (below) already opens/closes tcp on the *request* it issued, which is the
+        # one thing that's actually authoritative for tcp's lifecycle -- there's no "left
+        # stream_tcp via some other side channel" case the way there is for camera_calibration
+        # (its console's own `exit` command, unrelated to this class's set_state path at all).
         while not self._stop_poll:
             try:
                 st = self.device.call("get_status", timeout=2.0).data.get("state")
@@ -131,8 +161,6 @@ class Server:
                     self.calib.enter()
                 elif st != "camera_calibration" and self.calib.active:
                     self.calib.leave()
-                if st != "stream_tcp" and self.tcp.running:
-                    self.tcp.stop()
                 self._last_state = st
             time.sleep(1.0)
 
@@ -185,10 +213,17 @@ class Server:
         # and come back "not in camera_calibration".
         if state == "camera_calibration":
             self._wait_for_device_state("camera_calibration", timeout=2.0)
+            # Set *before* calib.enter() (its startup register backup takes ~9s), not after:
+            # otherwise the poll loop's own "st != self._last_state" keeps reading True for
+            # that whole window and repeatedly tries to enter too -- harmless now that
+            # CalibrationManager.enter() is lock-protected (only one build ever actually
+            # happens), but pointless work avoided by updating this first.
+            self._last_state = state
             self.calib.enter()
-        elif was_calibrating:
-            self.calib.leave()
-        self._last_state = state
+        else:
+            if was_calibrating:
+                self.calib.leave()
+            self._last_state = state
         return data
 
     def _wait_for_device_state(self, want: str, timeout: float) -> None:
