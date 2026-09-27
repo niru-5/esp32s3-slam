@@ -197,6 +197,22 @@ existing command set, valid only while `CAMERA_CALIBRATION` is active).
 * The module is mounted rotated ≈90°, which mirror/flip cannot correct (only 180° via mirror+flip).
 * A full 12 288-register dump takes ≈9 s; a 1280×720 RAW8 frame (0.9 MB) takes ≈0.4 s over WiFi.
 
+**Orientation fix, verified live (2026-09-27):** confirmed on real hardware, not just unit
+tests. `orient 0 1` (a different mirror/flip combo than `orient 1 1`) changed `0x4514` from
+`0xAA` to `0xBB` (`0x4520` unchanged, `0x0B`) — matching `cmd_set_orientation`'s new
+old/new-for-both reply and `RegisterBank.set_orientation()`'s undo-log tracking exactly;
+reverting with `orient 0 0` brought `0x4514` back to `0xAA`. Separately, `orient 1 1` then
+`mode raw8 hd` (a full `camera_init_ex` reconfigure) left `0x3820`/`0x3821` at `0x07`/`0x07`,
+not the RAW8-mode reset default — confirming `App.set_mode()`'s reapply actually fires and
+holds on hardware, not just in the fake-device test. Visually: debayering the same `orient 1
+1` RAW8 capture with `mirror=flip=False` (the bug) vs. `mirror=flip=True` (the fix) gives a
+clearly cooler/blue-shifted image near the frame's light source in the buggy version and a
+warm/pink one — matching the correct-orientation image, and matching the (unrotated)
+`before_orient` capture's own warm-near-the-light coloring — in the fixed version. The
+before/after picture feature (`tune timing --yes`) also confirmed live: `/calib/before.jpg`
+went from empty to a real JPEG the moment the step's pre-change snapshot landed, independent
+of `/calib/live.jpg` (which only updates for steps that call `c.show()`, e.g. `orientation`).
+
 ## Tests
 
 ```bash
