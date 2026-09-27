@@ -82,6 +82,22 @@ class RegisterBank:
     def set_bits(self, addr: int, mask: int, value: int, **kw) -> list[dict]:
         return self.write([(addr, value & mask, mask)], **kw)
 
+    def sync_orientation(self) -> None:
+        """Read 0x3820/0x3821 from the device and set self.mirror/.flip to match. Call once
+        per session (App.__init__) so tracked orientation reflects whatever the sensor
+        actually has *right now* -- e.g. NVS-persisted overrides from an earlier `save
+        --apply` are re-applied on every camera_init(), so a fresh session can easily start
+        against an already-mirrored/flipped sensor. Without this, __init__'s False/False
+        default would silently desync analysis.py's oriented Bayer-plane helpers (and the
+        "Current" calibration picture) from the real hardware state until the operator
+        happened to run `orient` again themselves. Best-effort: a read failure here just
+        leaves the False/False default rather than blocking session startup."""
+        try:
+            r20, r21 = self.read(0x3820, 2)
+            self.mirror, self.flip = bool(r21 & 0x06), bool(r20 & 0x06)
+        except Exception:
+            pass
+
     def set_orientation(self, mirror: bool, flip: bool) -> dict:
         r = self.link.call("set_orientation", mirror=int(mirror), flip=int(flip))
         if not r.ok:

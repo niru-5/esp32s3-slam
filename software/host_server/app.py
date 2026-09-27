@@ -42,8 +42,9 @@ import time
 from pathlib import Path
 
 from . import wire
-from .bag_recorder import RecordingSlot
+from .bag_recorder import RecordingSlot, ros_available, ros_import_error
 from .calibration import intrinsics as ix
+from .calibration import tuning
 from .calibration.cli import App
 from .calibration.console import CalibrationConsole
 from .calibration.liveview import LiveView
@@ -104,6 +105,11 @@ class CalibrationManager:
             app = App(self.device, self.session, self.view, self.board, out=out, readline=readline)
             try:
                 app.startup_backup()
+                # Populate the "Current" picture right away -- otherwise the calibration
+                # panel stays blank until the operator runs a tune step, and App's own
+                # RegisterBank.sync_orientation() (in App.__init__ above) means this already
+                # reflects the sensor's *actual* current orientation, not an assumed default.
+                tuning.snapshot_current(app, "session_start")
             except DeviceSessionError as exc:
                 out(f"startup backup failed: {exc}")
             return app
@@ -196,6 +202,18 @@ class Server:
     def _set_state(self, body: dict) -> dict:
         state = body.get("state", "")
         was_calibrating = self._last_state == "camera_calibration"
+        # Leave calibration *before* telling the device to change state, not after: the
+        # console's worker thread can still be mid-`tune <step>` (or any other multi-call
+        # command) when the operator switches to Streaming without going through the
+        # console's own `exit`. leave()/CalibrationConsole.close() now waits for that
+        # in-flight command to actually finish (see console.py) -- doing that while the
+        # device is *still* in camera_calibration lets it finish (or fail) on its own terms.
+        # Doing it after would mean the device has already left the state out from under it,
+        # so every further reg_read/reg_write/capture call the orphaned command makes starts
+        # failing "not in camera_calibration" -- the "no graceful exit" bug: switch away
+        # mid-step and the step (and its own register-revert cleanup) half-breaks.
+        if state != "camera_calibration" and was_calibrating:
+            self.calib.leave()
         try:
             data = self.device.call("set_state", **body).data
         except DeviceSessionError as exc:
@@ -223,8 +241,8 @@ class Server:
             self._last_state = state
             self.calib.enter()
         else:
-            if was_calibrating:
-                self.calib.leave()
+            # calib.leave() (if needed) already ran above, before the device.call() -- just
+            # record the new state here.
             self._last_state = state
         return data
 
@@ -243,6 +261,11 @@ class Server:
         snap = self.hub.snapshot()
         snap["recording"] = self.recorder.enabled
         snap["bag_uri"] = self.recorder.bag_uri
+        # So the browser can grey out "record to ROS bag" with a clear reason instead of
+        # silently reverting the checkbox after a failed set_recording -- same pattern as
+        # imu_available for the "include IMU" checkbox.
+        snap["ros_available"] = ros_available()
+        snap["ros_import_error"] = "" if ros_available() else ros_import_error()
         snap["device"] = self.device.status()
         try:
             snap["device"]["get_status"] = self.device.call("get_status", timeout=3.0).data

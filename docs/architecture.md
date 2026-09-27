@@ -143,7 +143,10 @@ The host side is **one process**, `python -m host_server` (`software/host_server
 `http.server` + `numpy`/`cv2` for the calibration/intrinsics math) serving one browser page:
 streaming (mode/sink/fps/resolution/IMU toggle/ROS bag recording) and the full calibration
 console (register access, the ten ISP tuning steps, checkerboard intrinsics — see
-[camera_calibration_and_tuning.md](camera_calibration_and_tuning.md)). `cli.py`
+[camera_calibration_and_tuning.md](camera_calibration_and_tuning.md)). See
+[host_server_architecture.md](host_server_architecture.md) for how that one process itself is
+put together (module map, the control channel client, streaming ingest, the calibration
+console). `cli.py`
 (`host_server.calibration run`) is a thin terminal client of that same running server's
 calibration-console endpoints now, not a second device connection — "I like the command
 tool" from whoever's actually driving this stays true, it just talks over HTTP to the

@@ -48,6 +48,7 @@
   .imgpair { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
   .imgpair > div { flex: 1 1 240px; min-width: 160px; }
   .imgpair .frame { margin-bottom: 4px; }
+  #camera-controls.loading { opacity: .4; pointer-events: none; }
   .axisgrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; max-width: 300px; }
   .steps { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
   .console { background: #0a0c0e; border: 1px solid #23262b; border-radius: 6px; padding: 8px;
@@ -104,6 +105,7 @@
         <div class="row">
           <label class="check"><input type="checkbox" id="record"> record to ROS bag</label>
           <span class="muted" id="bag_uri"></span>
+          <span class="muted" id="record_note"></span>
         </div>
         <div class="frame"><img id="cam" alt="camera stream" src="/stream.mjpg"></div>
       </div>
@@ -116,37 +118,41 @@
         </div>
 
         <div id="camera-sub" style="display:none">
+          <div id="camera-loading" class="banner warn" style="display:none">
+            Entering calibration mode — backing up sensor registers (~9s)…</div>
           <div class="imgpair">
             <div>
-              <div class="muted">Before</div>
-              <div class="frame"><img id="calib_before_img" alt="before picture" src="/calib/before.jpg"></div>
+              <div class="muted">Current (before this step's changes)</div>
+              <div class="frame"><img id="calib_before_img" alt="current picture"></div>
             </div>
             <div>
               <div class="muted">Live / After</div>
-              <div class="frame"><img id="calib_img" alt="calibration capture" src="/calib/live.jpg"></div>
+              <div class="frame"><img id="calib_img" alt="calibration capture"></div>
             </div>
           </div>
-          <div class="row">
-            <button id="capture-single" class="sm">Capture single image</button>
-            <button id="save-apply" class="sm">Save tuned registers</button>
-            <button id="save-status" class="sm">Save status</button>
-            <button id="save-clear" class="sm">Clear saved</button>
-          </div>
-          <div class="muted" style="margin-bottom:8px">ISP tuning steps (each backs up registers,
-            asks you to set up the scene, applies variants, reports before/after):</div>
-          <div class="steps" id="tune-steps"></div>
-          <div class="row">
-            <button id="cal-auto" class="sm">cal auto 20</button>
-            <button id="cal-solve" class="sm">cal solve --save</button>
-            <button id="cal-status" class="sm">cal status</button>
-          </div>
-          <div class="muted">Console — any <code>cli.py</code> command (<code>reg</code>,
-            <code>regw</code>, <code>tune &lt;step&gt;</code>, <code>cal ...</code>,
-            <code>save ...</code>, <code>help</code> for the full list):</div>
-          <div class="console" id="console"></div>
-          <div class="console-input">
-            <input type="text" id="console-in" placeholder="calib&gt; help" autocomplete="off">
-            <button id="console-send" class="sm">Send</button>
+          <div id="camera-controls">
+            <div class="row">
+              <button id="capture-single" class="sm">Capture single image</button>
+              <button id="save-apply" class="sm">Save tuned registers</button>
+              <button id="save-status" class="sm">Save status</button>
+              <button id="save-clear" class="sm">Clear saved</button>
+            </div>
+            <div class="muted" style="margin-bottom:8px">ISP tuning steps (each backs up registers,
+              asks you to set up the scene, applies variants, reports before/after):</div>
+            <div class="steps" id="tune-steps"></div>
+            <div class="row">
+              <button id="cal-auto" class="sm">cal auto 20</button>
+              <button id="cal-solve" class="sm">cal solve --save</button>
+              <button id="cal-status" class="sm">cal status</button>
+            </div>
+            <div class="muted">Console — any <code>cli.py</code> command (<code>reg</code>,
+              <code>regw</code>, <code>tune &lt;step&gt;</code>, <code>cal ...</code>,
+              <code>save ...</code>, <code>help</code> for the full list):</div>
+            <div class="console" id="console"></div>
+            <div class="console-input">
+              <input type="text" id="console-in" placeholder="calib&gt; help" autocomplete="off">
+              <button id="console-send" class="sm">Send</button>
+            </div>
           </div>
         </div>
 
@@ -243,13 +249,32 @@ document.getElementById("sink-wifi").onclick   = () => post("set_state", Object.
 document.getElementById("sink-sdcard").onclick = () => post("set_state", Object.assign({state:"stream_sdcard"}, streamParams()));
 document.getElementById("sink-tcp").onclick    = () => post("set_state", Object.assign({state:"stream_tcp"}, streamParams()));
 document.getElementById("sink-idle").onclick   = () => post("set_state", {state:"idle"});
-document.getElementById("record").onchange = (e) => post("set_recording", {enabled: e.target.checked});
+document.getElementById("record").onchange = async (e) => {
+  const checked = e.target.checked;
+  const noteEl = document.getElementById("record_note");
+  noteEl.textContent = "";
+  const r = await post("set_recording", {enabled: checked});
+  if (!r.ok) {
+    // Revert immediately with a reason instead of leaving it checked until the next
+    // poll() silently unchecks it with no explanation (e.g. ROS 2 not sourced into this
+    // host_server process -- the common case, see the ros_available check in poll() too).
+    e.target.checked = false;
+    noteEl.textContent = r.err || "failed to start recording";
+  }
+};
 
 // ---- Calibration target ----
+let calibReady = false;
+function setCalibLoading(loading) {
+  calibReady = !loading;
+  document.getElementById("camera-loading").style.display = loading ? "block" : "none";
+  document.getElementById("camera-controls").classList.toggle("loading", loading);
+}
 document.getElementById("target-camera").onclick = () => {
   document.getElementById("camera-sub").style.display = "block";
   document.getElementById("imu-sub").style.display = "none";
   setActive(["target-camera", "target-imu"], "target-camera");
+  setCalibLoading(true);
   post("set_state", {state: "camera_calibration"});
 };
 document.getElementById("target-imu").onclick = () => {
@@ -303,6 +328,25 @@ for (const step of TUNE_STEPS) {
   stepsDiv.appendChild(run);
 }
 
+// Data-URI placeholder shown until a real image exists (version 0) -- an empty-body
+// /calib/live.jpg or /calib/before.jpg response otherwise renders as a browser broken-image
+// icon, which is what part of the reported "flickering" turned out to be: see the version
+// tracking below for the other half.
+const PLACEHOLDER_IMG = "data:image/svg+xml," + encodeURIComponent(
+  "<svg xmlns='http://www.w3.org/2000/svg' width='320' height='240'>" +
+  "<rect width='100%' height='100%' fill='#000'/>" +
+  "<text x='50%' y='50%' fill='#555' font-family='sans-serif' font-size='14' " +
+  "text-anchor='middle' dominant-baseline='middle'>waiting for image…</text></svg>");
+let lastLiveVersion = -1, lastBeforeVersion = -1;
+function setImgIfChanged(imgId, url, version, lastVersion) {
+  if (version === lastVersion) return lastVersion;   // no-op: re-assigning .src to the exact
+                                                       // same value still re-triggers a load
+                                                       // in most browsers -- a visible flicker
+                                                       // every 600ms poll for no reason.
+  document.getElementById(imgId).src = version > 0 ? (url + "?v=" + version) : PLACEHOLDER_IMG;
+  return version;
+}
+
 async function pollCalib() {
   try {
     const r = await fetch(`/calib/output.json?since=${consoleSince}`, {cache:"no-store"});
@@ -312,8 +356,9 @@ async function pollCalib() {
     document.getElementById("console-in").placeholder = waitingForAnswer
       ? "press Enter (or type q to skip)…" : "calib> help";
     for (const line of j.lines) consoleLine(line, line.startsWith("calib>") ? "prompt" : "");
-    document.getElementById("calib_img").src = "/calib/live.jpg?v=" + j.live_version;
-    document.getElementById("calib_before_img").src = "/calib/before.jpg?v=" + j.before_version;
+    lastLiveVersion = setImgIfChanged("calib_img", "/calib/live.jpg", j.live_version, lastLiveVersion);
+    lastBeforeVersion = setImgIfChanged("calib_before_img", "/calib/before.jpg", j.before_version, lastBeforeVersion);
+    if (document.getElementById("camera-sub").style.display !== "none") setCalibLoading(!j.active);
   } catch (e) { /* ignore transient errors */ }
 }
 
@@ -365,6 +410,15 @@ async function poll() {
     document.getElementById("imu_hz").textContent = j.imu_hz;
     document.getElementById("record").checked = !!j.recording;
     document.getElementById("bag_uri").textContent = j.recording ? j.bag_uri : "";
+    // Grey out + explain "record to ROS bag" when this host_server process wasn't started
+    // with ROS 2 sourced -- same pattern as include_imu above. Without this, clicking it
+    // just silently reverts a moment later (set_recording fails, this poll() re-syncs
+    // `recording` back to false) with no visible reason.
+    const rosAvail = !!j.ros_available;
+    document.getElementById("record").disabled = !rosAvail;
+    if (!rosAvail) document.getElementById("record_note").textContent =
+      "(ROS 2 not available on the host: " + (j.ros_import_error || "not sourced") + ")";
+    else if (!j.recording) document.getElementById("record_note").textContent = "";
     if (j.stats) {
       setCpu("cpu0", "cpu0bar", j.stats.cpu0_load);
       setCpu("cpu1", "cpu1bar", j.stats.cpu1_load);

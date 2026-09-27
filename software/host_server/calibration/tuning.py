@@ -498,6 +498,28 @@ STEPS: dict[str, Step] = {s.key: s for s in [
 ]}
 
 
+def snapshot_current(app, tag: str = "current") -> None:
+    """One frame, captured right now in the app's current camera mode/orientation, shown as
+    the calibration panel's "Current" picture (LiveView.before_* / GET /calib/before.jpg --
+    the attribute/route names predate this rename, see docs/camera_calibration_and_tuning.md).
+    Called both right after entering calibration (CalibrationManager._enter_locked's factory
+    in app.py) -- so the operator sees the real current state immediately, not a blank panel
+    until they run a tuning step -- and again at the start of every `tune <step>` (Tuner.run,
+    below) so it reflects state right before that step's own changes. Best-effort: a capture
+    hiccup here must never abort whatever the caller was doing."""
+    try:
+        r = app.link.call("capture", timeout=15, n=1, flush=3, regs="none", tag=tag)
+        if not r.ok or not r.images:
+            return
+        img = decode(r.images[0])
+        if img.ndim == 2:          # raw8: debayer (oriented per the sensor's current mirror/
+                                    # flip) so "Current" is a real picture, not a grey Bayer mosaic
+            img = an.debayer(img, mirror=app.regs.mirror, flip=app.regs.flip)
+        app.view.update_before_bgr(img, f"{tag}: current")
+    except Exception as exc:
+        app.out(f"  (current-picture capture skipped: {exc})")
+
+
 class Tuner:
     def __init__(self, app):
         self.app = app
@@ -525,31 +547,13 @@ class Tuner:
             return
         self.run(STEPS[a[0]], a[1:])
 
-    def _snapshot_before(self, step: Step) -> None:
-        """One frame, captured before this step touches any register, for the browser's
-        before/after comparison (LiveView.before_* / GET /calib/before.jpg) -- the running
-        `show()`/live picture already ends up showing the *after* state once the step's
-        variants run, so this is the only place the "before" side needs to be grabbed.
-        Best-effort: a capture hiccup here shouldn't abort the tuning step itself."""
-        try:
-            r = self.app.link.call("capture", timeout=15, n=1, flush=3, regs="none", tag=f"{step.key}_before")
-            if not r.ok or not r.images:
-                return
-            img = decode(r.images[0])
-            if img.ndim == 2:      # raw8: debayer (oriented per the sensor's current mirror/
-                                    # flip) so "before" is a real picture, not a grey Bayer mosaic
-                img = an.debayer(img, mirror=self.app.regs.mirror, flip=self.app.regs.flip)
-            self.app.view.update_before_bgr(img, f"{step.key}: before")
-        except Exception as exc:
-            self.app.out(f"  (before-picture capture skipped: {exc})")
-
     def run(self, step: Step, rest: list[str]) -> None:
         out = self.app.out
         yes, keep = "--yes" in rest, "--keep" in rest
         opts = dict(kv.split("=", 1) for kv in rest if "=" in kv)
         out(f"\n=== {step.title} ===")
         before = self.app.backup(f"{step.key}_before_{time.strftime('%H%M%S')}")
-        self._snapshot_before(step)
+        snapshot_current(self.app, step.key)
         out(f"\nSET UP: {step.setup}")
         out(f"EXPECT: {step.expect}\n")
         if not yes:

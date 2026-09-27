@@ -91,5 +91,35 @@ class CalibrationConsole:
             finally:
                 self._busy = False
 
-    def close(self) -> None:
+    def close(self, timeout: float = 20.0) -> None:
+        """Stop accepting new commands and wait for whatever's currently running to actually
+        finish, instead of just flagging `_stop` and walking away.
+
+        `_stop = True` alone only stops the worker picking up its *next* queued command --
+        the loop is still blocked inside `self.app.run_line(line)` for however long the
+        in-flight one takes (a multi-variant `tune` step can run tens of seconds). A caller
+        that tears the console down right after this returns (CalibrationManager.leave(),
+        via Server._set_state() when the browser switches away from Camera Calibration
+        without going through the console's own `exit`) used to set `self.console = None`
+        immediately while that orphaned thread kept running against the *same* DeviceSession
+        -- once the device itself left camera_calibration, every further reg_read/reg_write/
+        capture call from the orphaned step started failing "not in camera_calibration",
+        appended to a buffer nothing polls any more, with the step's own register-revert
+        `finally` blocks then failing too. That's the "no graceful exit" failure: a step
+        started, the operator switched to Streaming mid-run, and things silently half-broke.
+
+        If the worker is blocked on `tune`'s "press Enter when ready" readline(), nothing
+        will ever answer it now -- push "q" (tuning.py's own skip-the-step answer) so it
+        unblocks instead of hanging until the timeout. Otherwise just wait for the current
+        command to run to completion (or fail fast once the device state changes under it,
+        which it currently still can if the device.call() itself is what's mid-flight when
+        the caller's own set_state lands -- see Server._set_state()'s ordering, which closes
+        the console *before* changing device state specifically to avoid that)."""
         self._stop = True
+        if self._waiting_for_answer:
+            self._answer_queue.put("q")
+        self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            print(f"[calib-console] warning: worker still busy after {timeout:.0f}s close() "
+                  f"timeout -- abandoning it (daemon thread, won't block process exit, but its "
+                  f"device calls may still race whatever runs next)")

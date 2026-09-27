@@ -166,6 +166,19 @@ class WithFakeDevice(unittest.TestCase):
         self.assertEqual(self.dev.regs[0x3820], before[0x3820])
         self.assertEqual(self.dev.regs[0x3821], before[0x3821])
 
+    def test_new_session_syncs_orientation_from_device(self):
+        """A fresh App (a new calibration session) must not assume mirror=flip=False -- it
+        should read whatever the device's registers actually are right now (e.g. NVS-
+        persisted orientation from an earlier `save --apply`, re-applied by every
+        camera_init()), not silently desync analysis.py's oriented Bayer-plane helpers (and
+        the calibration panel's "Current" picture) from the real hardware state. Simulate
+        that by setting the mirror/flip bits directly (bypassing this App's own
+        set_orientation() tracking) and constructing a second App against the same device."""
+        self.app.regs.write([(0x3821, 0x06, 0x06), (0x3820, 0x06, 0x06)])
+        fresh = App(self.link, self.session, LiveView(None), ix.Board(9, 6, 25.0), out=self.lines.append)
+        self.assertTrue(fresh.regs.mirror)
+        self.assertTrue(fresh.regs.flip)
+
     def test_set_orientation_tracks_mirror_flip(self):
         """RegisterBank.mirror/.flip is the source of truth analysis.py's oriented Bayer
         helpers (bayer_planes/plane_stats/debayer) and App.set_mode()'s reapply-after-reset

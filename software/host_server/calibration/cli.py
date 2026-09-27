@@ -86,6 +86,7 @@ class App:
     def __init__(self, link, session: Session, view: LiveView, board: ix.Board, out=print, readline=None):
         self.link, self.session, self.view, self.out = link, session, view, out
         self.regs = RegisterBank(link)
+        self.regs.sync_orientation()   # don't assume mirror=flip=False -- read what's actually there
         self.flow = IntrinsicFlow(link, session, board, view, out)
         self.mode = {"fmt": link.hello.get("fmt", "jpeg"), "size": link.hello.get("size", "svga")}
         self.startup_dump: dict[int, int] = {}

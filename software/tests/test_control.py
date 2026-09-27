@@ -132,11 +132,15 @@ class ServerWithFakeDevice(unittest.TestCase):
 
         r = _post(self.http_port, "/calib/line", {"line": "info"})
         self.assertTrue(r["ok"])
-        for _ in range(50):
+        # Generous budget: entering calibration now also does a sync_orientation() reg_read
+        # and a snapshot_current() capture (both best-effort, but still real round trips)
+        # before the console's worker thread even starts draining "info" off the queue --
+        # under load, a tight window here was observed to flake.
+        for _ in range(100):
             out = _get(self.http_port, f"/calib/output.json?since={out['next']}")
             if out["lines"]:
                 break
-            time.sleep(0.05)
+            time.sleep(0.1)
         self.assertTrue(any("sensor_pid" in line for line in out["lines"]))
 
         # capture exercises MSG_IMAGE handling through the merged protocol.
@@ -159,6 +163,46 @@ class ServerWithFakeDevice(unittest.TestCase):
         self.assertTrue(self.state.tcp.running)
         _post(self.http_port, "/command", {"cmd": "set_state", "state": "idle"})
         self.assertFalse(self.state.tcp.running)
+
+    def test_leaving_calibration_waits_for_busy_console(self):
+        """Regression test for the "no graceful exit" bug reported from real hardware:
+        switching to Streaming while a calibration console command (e.g. a `tune` step) is
+        still running used to tear the console down immediately (CalibrationConsole.close()
+        just flagged a bool and walked away) while the device.call("set_state", ...) that
+        drives that switch ran *first* -- so the orphaned worker thread's next reg_read/
+        reg_write/capture call landed on a device that had already left camera_calibration
+        and started failing "not in camera_calibration", with the command's own cleanup
+        (register-revert `finally` blocks) then failing too. Server._set_state() now closes
+        the console (which waits for the busy command) *before* changing device state, and
+        CalibrationConsole.close() actually joins the worker instead of firing-and-forgetting.
+        Slow the fake device's reg_dump down to reliably create the race window."""
+        j = _post(self.http_port, "/command", {"cmd": "set_state", "state": "camera_calibration"})
+        self.assertTrue(j["ok"])
+        for _ in range(50):
+            if self.dev.state == "camera_calibration":
+                break
+            time.sleep(0.05)
+        self.dev.reg_dump_delay = 1.5
+        busy_console = self.state.calib.console
+        self.assertIsNotNone(busy_console)
+
+        r = _post(self.http_port, "/calib/line", {"line": "dump testdump"})
+        self.assertTrue(r["ok"])
+        time.sleep(0.3)   # let the worker actually pick up the command and start the reg_dump
+
+        t0 = time.monotonic()
+        j = _post(self.http_port, "/command", {"cmd": "set_state", "state": "stream_wifi"})
+        elapsed = time.monotonic() - t0
+
+        self.assertTrue(j["ok"])
+        self.assertEqual(self.dev.state, "stream_wifi")
+        self.assertFalse(self.state.calib.active)
+        # The whole point: this blocked until the busy dump actually finished, rather than
+        # racing it -- not merely "eventually consistent" a second later via the poller.
+        self.assertGreater(elapsed, 1.0, "set_state returned before the busy console command finished")
+        lines, _ = busy_console.output(0)
+        self.assertFalse(any("error:" in l for l in lines), f"orphaned console command failed: {lines}")
+        self.assertTrue(any("registers ->" in l for l in lines), f"dump never completed cleanly: {lines}")
 
     def test_concurrent_enter_builds_exactly_one_session(self):
         """Regression test for a race found on real hardware: CalibrationManager.enter()'s
