@@ -1,64 +1,78 @@
 # Camera calibration and ISP tuning
 
-Host-driven workflow for two jobs on the OV5640:
+Host-driven workflow for two jobs on the OV5640, both reachable from **one browser page**
+(`python -m host_server`, see `docs/architecture.md` "Control channel") or from a terminal
+(`cli.py`, a thin client of that same running server — see below):
 
 1. **Intrinsic calibration** with a checkerboard — capture N views on demand, gate them, solve on the fly, store everything so it can be re-solved later.
 2. **ISP tuning** — the ten steps of [`OV5640_tuning_playbook_bench_procedures.md`](OV5640_tuning_playbook_bench_procedures.md), each one backing up the sensor registers first, applying variants, saving frames + register state, and telling the operator what to expect. Theory is in [`OV5640 _ISP_theory_from_first_principles.md`](OV5640%20_ISP_theory_from_first_principles.md).
 
 ```
- ESP32-S3 (firmware/data_capture)                          host (software/)
-┌──────────────────────────────────┐   WiFi, TCP 8084    ┌──────────────────────────────────────────┐
-│ serial '5' → CAMERA_CALIBRATION  │ ───────────────────►│ python -m host_server.calibration run     │
-│  cam_calib_task (device = client)│  device dials host  │  ├─ link.py       framing, request/reply │
-│   capture N frames + metadata    │ ────── frames ────► │  ├─ registers.py  dump/undo/restore      │
-│   reg read / write / dump        │ ────── replies ───► │  ├─ flow.py       intrinsics capture+solve│
-│   set_mode (jpeg/raw8/…, size)   │                     │  ├─ tuning.py     10 guided steps        │
-│   set_orientation, fps_probe     │                     │  ├─ session.py    on-disk layout         │
-└──────────────────────────────────┘                     │  └─ liveview.py   http://localhost:8090/ │
-                                                         └──────────────────────────────────────────┘
+ ESP32-S3 (firmware/data_capture)                    host (software/, ONE process)
+┌───────────────────────────────┐  TCP 8085 (only  ┌───────────────────────────────────────┐
+│ control_link.c (device=client)│  control socket) │ python -m host_server                  │
+│  set_state camera_calibration │◄─────────────────┤  http://localhost:8080/  (the one page)│
+│  capture N frames + metadata  │──── frames ──────►│  ├─ app.py            HTTP + /command  │
+│  reg read / write / dump      │◄─── replies ──────┤  ├─ device_session.py device connection│
+│  set_mode, set_orientation,   │                   │  ├─ calibration/console.py  worker     │
+│  fps_probe, save_camera_regs  │                   │  ├─ calibration/{registers,flow,tuning,│
+└───────────────────────────────┘                   │  │   intrinsics,session}.py  (unchanged)│
+                                                     │  └─ calibration/cli.py  App + terminal │
+                                                     │     client (ConsoleClient)             │
+                                                     └───────────────────────────────────────┘
 ```
 
-(`serial '5'` above is one of two ways in now — `software/host_server/control`'s browser UI can
-also flip the device into `CAMERA_CALIBRATION` over its own always-on socket, TCP 8085; see
-"Control channel" below.)
+Camera calibration used to need its own dedicated socket/port purely so two separate host
+processes (a streaming server and a calibration tool) wouldn't contend for one port. With a
+single host process there's no more reason for that split: mode switching, calibration, and
+streaming all go over the one control socket the device dials.
 
 ## Quick start
 
 ```bash
-# one-off: host tools need numpy + OpenCV (the streaming server itself stays stdlib-only)
+# one-off: host tools need numpy + OpenCV
 cd software && python3 -m venv .venv && .venv/bin/pip install -r requirements-calib.txt
 
 # firmware: build + flash (>= 45 s if using the flash_monitor wrapper, see docs/learnings.md)
 .claude/skills/esp32-idf/scripts/build.sh data_capture
 .claude/skills/esp32-idf/scripts/flash_monitor.sh data_capture /dev/ttyACM0 45
 
-# session: listens on :8084, waits for the boot log, sends '5' over serial, waits for the device to dial in
-cd software && .venv/bin/python -m host_server.calibration run --serial /dev/ttyACM0
-#   or, with no serial cable at all: if software/host_server/control (see below) is already
-#   running, `run` asks it to flip the device into calibration mode over the control channel
-.venv/bin/python -m host_server.calibration run
-#   or, if the device is already in mode 5 by some other means -- it keeps retrying until the host is up:
-.venv/bin/python -m host_server.calibration run --no-control
+# host: the one command, one URL
+cd software && .venv/bin/python -m host_server
+# -> open http://localhost:8080/ in a browser: Mode -> Calibration -> Camera
 ```
 
-On connect the tool creates `software/calib_data/<timestamp>/`, **backs up all 12 288 sensor registers** to `settings/00_startup.json` (~9 s), and opens an interactive `calib>` prompt (`help` lists everything). `http://localhost:8090/` shows the latest frame with detected corners and the running status. `exit` sends the device back to normal streaming config; `quit` leaves the tool and keeps the device in calibration mode. Serial `3` also aborts the mode on the device.
+The browser page's Calibration panel is the primary way in: click "Camera", which puts the
+device into `CAMERA_CALIBRATION` and starts a session (`software/calib_data/<timestamp>/`,
+**backs up all 12 288 sensor registers** to `settings/00_startup.json`, ~9 s). From there you
+get a live capture image, a "Capture single image" button, quick-launch buttons for the ISP
+tuning steps and intrinsics capture, save/save-status/save-clear buttons, and a command
+console that runs any of the commands below (`reg`, `regw`, `tune <step>`, `cal ...`,
+everything in `help`'s output) with live output.
 
-> **Connection direction:** the device dials the host (`CONFIG_REMOTE_HOST:CONFIG_CAM_CALIB_PORT`, 8084) and retries every ~3 s until the host tool is listening, and re-dials if the link drops — the host never has to poll for it. The host firewall must allow inbound TCP **8084** (like 8080–8083 for streaming, and 8085 for the control channel below). If the device log shows `connect to <host>:<port> failed: errno 116/113`, it's usually a firewall/VPN dropping the SYN — NordVPN's firewall with LAN Discovery off does this, and so does a plain `ufw`/`iptables` host firewall that simply has no rule for that port yet (verified on real hardware while building the control channel: `sudo ufw allow <port>/tcp` fixed it in one shot — a brand-new port needs its own rule even when an existing one already covers a neighbouring port).
+**Prefer a terminal?** `cli.py` (`host_server.calibration run`) is the exact same session, as
+a client instead of a browser tab — it does not own its own device connection anymore, it
+just talks to the already-running `python -m host_server`:
 
-## Control channel (mode switching + IMU calibration, no serial needed)
+```bash
+cd software && .venv/bin/python -m host_server.calibration run
+#   or, pointed at a server running elsewhere:
+.venv/bin/python -m host_server.calibration run --server http://otherhost:8080
+```
 
-`software/host_server/control` (`python -m host_server.control`, default ports 8085 device- /
-8091 browser-facing) is a small always-running app with a browser page: toggle Streaming vs.
-Calibration, pick a streaming sink or calibration target (Camera/IMU), and run IMU
-calibration's gravity-axis prompt from the page instead of the serial console. It talks to
-the device over `control_link.c`'s always-on socket (`CONFIG_CONTROL_PORT`, distinct from
-this tool's own `CONFIG_CAM_CALIB_PORT` on purpose — see `docs/architecture.md` "Control
-channel" for why they're kept separate). Run it once and leave it running; `cli.py run` (no
-`--serial`) uses it to enter `camera_calibration` remotely, as shown above.
+`exit` (either the browser or `cli.py`) sends the device back to normal streaming config;
+`quit` (`cli.py` only) leaves the terminal but keeps the device in calibration mode — the
+browser page (or a later `cli.py run`) picks the same session back up. Serial `3` also
+aborts the mode on the device, from either.
 
-It does **not** duplicate register-level tuning — that stays in this tool (`cli.py`), on
-purpose. What it adds for the camera side is just the mode toggle and a note pointing back
-here; the IMU side is fully interactive there (axis-picker buttons, before/after report).
+> **Connection direction:** the device dials the host (`CONFIG_REMOTE_HOST:CONFIG_CONTROL_PORT`,
+> 8085) and retries every ~3 s until the host is listening, and re-dials if the link drops —
+> the host never has to poll for it. The host firewall must allow inbound TCP **8085** (like
+> 8080–8083 for streaming). If the device log shows `connect to <host>:<port> failed: errno
+> 116/113`, it's usually a firewall/VPN dropping the SYN — NordVPN's firewall with LAN
+> Discovery off does this, and so does a plain `ufw`/`iptables` host firewall that simply has
+> no rule for that port yet (`sudo ufw allow 8085/tcp` — a brand-new port needs its own rule
+> even when a neighbouring one is already open).
 
 ## Intrinsic calibration (checkerboard)
 
@@ -151,13 +165,13 @@ of registers the operator intentionally changed. Device-side commands: `save_cam
 {writes:[{a,v}]}`, `clear_camera_regs`, `get_camera_overrides` (added to `cam_calib.c`'s
 existing command set, valid only while `CAMERA_CALIBRATION` is active).
 
-## Firmware side (`cam_calib.c`)
+## Firmware side (`control_link.c`, camera reconfigure in `cam_calib.c`)
 
-* Entered with serial `5` or `set_state camera_calibration` over the control channel (`state_machine.c`; see `docs/architecture.md` "Control channel"), streaming pipelines are torn down first (the device then dials the host); the camera is re-initialised as JPEG SVGA, quality 6, 2 frame buffers, *grab latest*. Leaving the mode (`exit`, serial `3`) restores the normal streaming camera config (and re-applies any saved register overrides, see "Persisting tuned registers").
-* Wire format: `uint32 len | uint8 type | body`, type `0x01` JSON (both ways), `0x02` IMAGE (`uint32 meta_len | meta JSON | frame bytes`). Commands: `ping`, `info`, `set_mode {format,framesize,quality,fb_count}`, `reg_read`, `reg_write {writes:[{a,v,m}]}` (replies old/new bytes → undo log), `reg_dump {ranges}`, `set_orientation {mirror,flip}` (through the driver, which also fixes the 0x4514 black-level-line registers), `capture {n,interval_ms,flush,regs,tag}`, `fps_probe {n}`, `save_camera_regs {writes:[{a,v}]}`, `clear_camera_regs`, `get_camera_overrides`, `exit`.
+* Entered with serial `5` or `set_state camera_calibration` over the control channel (`state_machine.c`; see `docs/architecture.md` "Control channel"), streaming pipelines are torn down first; `cam_calib_enter_mode()` re-initialises the camera as JPEG SVGA, quality 6, 2 frame buffers, *grab latest* — synchronously, no separate task. Leaving the mode (`exit`, serial `3`) calls `cam_calib_exit_mode()`, restoring the normal streaming camera config (and re-applying any saved register overrides, see "Persisting tuned registers").
+* Wire format: `uint32 len | uint8 type | body`, type `0x01` JSON (both ways), `0x02` IMAGE (`uint32 meta_len | meta JSON | frame bytes`) — all on `control_link.c`'s one always-on socket, gated on `CAMERA_CALIBRATION` being the active state. Commands: `ping`, `info`, `set_mode {format,framesize,quality,fb_count}`, `reg_read`, `reg_write {writes:[{a,v,m}]}` (replies old/new bytes → undo log), `reg_dump {ranges}`, `set_orientation {mirror,flip}` (through the driver, which also fixes the 0x4514 black-level-line registers), `capture {n,interval_ms,flush,regs,tag}`, `fps_probe {n}`, `save_camera_regs {writes:[{a,v}]}`, `clear_camera_regs`, `get_camera_overrides`, `exit`.
 * Formats: `jpeg`, `raw8`, `gray`, `rgb565`, `yuv422`. **RAW8** — the ESP32-S3 camera driver has no RAW path, so the sensor is brought up as GRAYSCALE (1 byte/pixel) and then `0x501F=0x03`, `0x4300=0x00` switch the OV5640 to Bayer output. It is the **top 8 of 10 bits** (a DN step is 4× the sensor's own black-level resolution) and it **bypasses the ISP scaler**, so only native readouts are coherent: `hd` (1280×720, the default for raw steps) and `vga` (640×480). At svga/xga/sxga the rows come out scrambled (the stream is really 1280 pixels wide); the tool warns when it sees this (it stays quiet on dark/flat frames, where there is nothing to measure).
 * A mode switch needs a ~32 KB contiguous internal-DRAM block for the camera DMA buffer, so the command/TX buffers are allocated in PSRAM.
-* The IMU is not part of this mode (`CONFIG_ENABLE_IMU` is 0 in the current build, and camera–IMU extrinsics are a separate calibration).
+* The IMU is not part of this mode (camera–IMU extrinsics are a separate calibration). Whether IMU hardware is present at all is now a runtime fact (`imu_available()`, see `docs/calibration.md`), not a compile-time toggle — irrelevant here either way.
 
 ## Findings on the real module (verified 2026-09-25)
 
@@ -171,12 +185,25 @@ existing command set, valid only while `CAMERA_CALIBRATION` is active).
 ## Tests
 
 ```bash
-cd software && .venv/bin/python -m unittest tests.test_calibration -v
+cd software && .venv/bin/python -m unittest tests.test_calibration -v   # registers/flow/tuning/intrinsics logic
+cd software && .venv/bin/python -m unittest tests.test_control -v      # the unified host_server.app
 ```
 
-`tests/fake_device.py` is an in-process stand-in for `cam_calib.c` (same protocol, fake register file, renders a distorted checkerboard from known intrinsics). The tests check that detection + solve recover the ground-truth `fx fy cx cy` and distortion, that the burst flow accepts/rejects/saves/re-solves offline, duplicates are rejected, and that backup / restore / undo / freeze behave. Everything hardware-specific (RAW8 geometry, register semantics, timing) was verified on the real device — see above.
+`tests/fake_device.py` is an in-process stand-in speaking the calibration protocol only (same
+shape `control_link.c` carries now, previously `cam_calib.c`'s own socket) — fake register
+file, renders a distorted checkerboard from known intrinsics. Used by `test_calibration.py`
+to check that detection + solve recover the ground-truth `fx fy cx cy` and distortion, that
+the burst flow accepts/rejects/saves/re-solves offline, duplicates are rejected, and that
+backup/restore/undo/freeze behave — exercising `App`/`RegisterBank`/`IntrinsicFlow` directly,
+independent of the HTTP layer. `tests/fake_control_device.py` speaks the *merged* protocol
+(state + calibration + images) and backs `test_control.py`, which exercises the whole stack
+through HTTP: `/status.json`, `/command`, and a full calibration-console lifecycle (startup
+backup, `info`/`reg`/`capture` via the console, a `tune` step's readline/`/calib/answer`
+path, `exit` torn down by the background poller, on-demand `STREAM_TCP` ports). Everything
+hardware-specific (RAW8 geometry, register semantics, timing) was verified on the real
+device — see above.
 
 ## Ports and known issues
 
-* Host ports: **8084** (this tool, inbound from the device), 8080 (`STREAM_WIFI` HTTP), 8081–8083 (`STREAM_TCP` frame/IMU/stats), **8085** (`software/host_server/control`, inbound from the device), 8091 (that app's browser page, only needed inbound if browsing from another host on the LAN). All must be open inbound on the host firewall -- see the `ufw`/VPN note under Quick start; each port needs its own allow rule, one working port doesn't imply the next one will.
+* Host ports: **8080** (the one browser page + `STREAM_WIFI` HTTP ingest, must be reachable to open the page at all), **8085** (the device's control channel, inbound from the device — calibration, mode switching, IMU calibration all go over this one), 8081–8083 (`STREAM_TCP` frame/IMU/stats — opened only while `STREAM_TCP` is the active mode, closed otherwise). All must be open inbound on the host firewall -- see the `ufw`/VPN note under Quick start; each port needs its own allow rule, one working port doesn't imply the next one will.
 * Streaming consumers (`net_client.c`, `tcp_client.c`, the stats writer) shut down cooperatively — see `docs/learnings.md` §14. Verified on hardware: after a calibration session `STREAM_WIFI` and `STREAM_TCP` stream normally (≈22 fps) and stop cleanly, also with the host unreachable.

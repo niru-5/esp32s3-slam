@@ -74,13 +74,15 @@ day-to-day way to drive the rig.
 | `2` | `stream_sdcard` | `STREAM_SDCARD` | start camera+IMU capture, log to the SD card |
 | `3` | `idle` | `IDLE` | stop streaming (any sink) — tear everything down |
 | `4` | `imu_calibration` | `IMU_CALIBRATION` | BMI270 hardware FOC calibration (`imu.c`/`state_machine.c`); gravity-axis prompt answerable from either serial or the control link (`imu_cal_axis`), see below |
-| `5` | `camera_calibration` | `CAMERA_CALIBRATION` | host-driven camera calibration / ISP tuning session (`cam_calib.c`, see [camera_calibration_and_tuning.md](camera_calibration_and_tuning.md)); stays in this state until the host sends `exit` or serial `3` |
+| `5` | `camera_calibration` | `CAMERA_CALIBRATION` | host-driven camera calibration / ISP tuning session (see [camera_calibration_and_tuning.md](camera_calibration_and_tuning.md)); stays in this state until the host sends `exit` or serial `3` |
 | `6` | `stream_tcp` | `STREAM_TCP` | start camera+IMU capture, stream to the host over three dedicated raw TCP sockets (`tcp_client.c`, one per stream) instead of HTTP |
 
-`set_state` (and `get_status`, `imu_cal_axis`/`imu_cal_abort`) travel over `control_link.c`,
-an always-on socket the device dials to the host independent of the state above (unlike
-`cam_calib.c`'s socket, which only exists while `CAMERA_CALIBRATION` is active) — see
-"Control channel" below.
+`set_state` (and `get_status`, `imu_cal_axis`/`imu_cal_abort`, and every camera-calibration
+command) all travel over `control_link.c`, the device's one always-on socket — see "Control
+channel" below. `set_state` also carries optional `fps`, `framesize`, `include_imu` fields
+for the three stream states (serial has no way to carry extra params, so a serial-triggered
+stream always uses the compiled defaults: `CONFIG_CAMERA_CAPTURE_FPS`, whatever resolution is
+already configured, and IMU never included).
 
 ### Transition rules
 
@@ -109,37 +111,49 @@ Both calibration states are fully implemented, not stubs:
   digit 1-6) *or* the control link's `imu_cal_axis` command; whichever arrives first wins.
   The same preview/report the serial log prints is also sent as `imu_cal_preview`/
   `imu_cal_report` events over the control link, so a host UI can render the same prompt.
-- `CAMERA_CALIBRATION` runs `cam_calib_task` (its own task, `cam_calib.c`), which owns the
-  camera and a dedicated socket (`CONFIG_CAM_CALIB_PORT`) until the host sends `exit` — see
+- `CAMERA_CALIBRATION` no longer needs its own task: entering/leaving it is a synchronous
+  camera reconfigure (`cam_calib_enter_mode()`/`cam_calib_exit_mode()`, `cam_calib.c`) done
+  by `state_machine.c` exactly like every other transition, and the always-on
+  `control_link.c` task (already running) serves the calibration protocol
+  (`info`/`set_mode`/`reg_read`/`reg_write`/`reg_dump`/`set_orientation`/`fps_probe`/
+  `capture`/`save_camera_regs`/`clear_camera_regs`/`get_camera_overrides`/`exit`), gated on
+  `app_state_t == CAMERA_CALIBRATION`. A dedicated task/socket for this used to exist
+  (`cam_calib.c` dialing its own `CONFIG_CAM_CALIB_PORT`) purely so two separate host
+  processes wouldn't contend for one port; with **one** host process
+  (`python -m host_server`) there's no more reason for that split — see
   [camera_calibration_and_tuning.md](camera_calibration_and_tuning.md).
 
 ### Control channel (`control_link.c`)
 
-A second, always-on socket (`CONFIG_CONTROL_PORT`, separate from `cam_calib.c`'s), dialed at
-boot and kept alive (dial/retry/reconnect) for the device's entire runtime, independent of
-`app_state_t`. Same framing as `cam_calib.c` (`uint32 len | uint8 type | body`, JSON only on
-this channel). Carries:
+The device's **one** control socket (`CONFIG_CONTROL_PORT`), dialed at boot and kept alive
+(dial/retry/reconnect) for the device's entire runtime, independent of `app_state_t`. Framing:
+`uint32 len | uint8 type | body`, type `0x01` JSON (both directions), type `0x02` IMAGE
+(device → host, camera-calibration captures only — same shape as before the merge). Carries:
 
 - `get_status` / `set_state` — the host-driven equivalent of serial commands 1-6 (see table
-  above). Posts into the same command queue the serial poll loop drains, so there is exactly
-  one place (`handle_command()`/the `enter_*()` functions) that ever mutates `s_state`.
+  above), plus `fps`/`framesize`/`include_imu` for the stream states. Posts into the same
+  command queue the serial poll loop drains, so there is exactly one place
+  (`handle_command()`/the `enter_*()` functions) that ever mutates `s_state`.
 - `imu_cal_axis` / `imu_cal_abort` — answers/aborts the `IMU_CALIBRATION` gravity-axis prompt
   (see above).
+- The whole camera-calibration command set (see above), valid only while
+  `CAMERA_CALIBRATION` is the active state — `"not in camera_calibration"` otherwise.
 
-The host side is `software/host_server/control` (a small stdlib-`http.server` app with a
-browser UI, deliberately separate from `cam_calib.c`'s host tool, `software/host_server/
-calibration`'s `cli.py`, so the two never contend for the same TCP port — the browser app is
-meant to run continuously; `cli.py` is an interactive session run on demand). It's the
-intended day-to-day control surface: toggle streaming vs. calibration mode, pick a streaming
-sink or calibration target, and run IMU calibration end-to-end without a serial cable. The
-serial console keeps working exactly as before, as the bring-up/recovery fallback.
+The host side is **one process**, `python -m host_server` (`software/host_server`, stdlib
+`http.server` + `numpy`/`cv2` for the calibration/intrinsics math) serving one browser page:
+streaming (mode/sink/fps/resolution/IMU toggle/ROS bag recording) and the full calibration
+console (register access, the ten ISP tuning steps, checkerboard intrinsics — see
+[camera_calibration_and_tuning.md](camera_calibration_and_tuning.md)). `cli.py`
+(`host_server.calibration run`) is a thin terminal client of that same running server's
+calibration-console endpoints now, not a second device connection — "I like the command
+tool" from whoever's actually driving this stays true, it just talks over HTTP to the
+already-running server instead of owning its own socket. The serial console keeps working
+exactly as before, as the bring-up/recovery fallback.
 
-Camera register tuning itself still goes through `cam_calib.c`'s own protocol/tool (`cli.py`,
-"I like the command tool" per the person who asked for this — the browser UI doesn't
-reimplement register-level tuning); what's new there is persistence: `cli.py`'s `save`
-command sends the session's tracked register writes to a new `save_camera_regs` command,
-which `camera_overrides.c` stores in NVS and re-applies after every future `camera_init()` —
-see [camera_calibration_and_tuning.md](camera_calibration_and_tuning.md) "Persisting tuned
+Persisting tuned registers: the calibration console's `save` command sends the session's
+tracked register writes to `save_camera_regs`, which `camera_overrides.c` stores in NVS and
+re-applies after every future `camera_init()` — see
+[camera_calibration_and_tuning.md](camera_calibration_and_tuning.md) "Persisting tuned
 registers".
 
 ---

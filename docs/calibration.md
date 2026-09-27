@@ -4,9 +4,10 @@
 
 Triggered by console command `4` on `data_capture` (`APP_STATE_IMU_CALIBRATION`,
 `state_machine.c:imu_calibration_run()`) — or, without a serial cable, `set_state
-imu_calibration` from `software/host_server/control`'s browser page, over the always-on
-control channel (`control_link.c`; see `docs/architecture.md` "Control channel"). Either way
-it calls `imu_run_hw_foc_calibration()` (`firmware/data_capture/main/imu.c`). Procedure:
+imu_calibration` from the one host page (`python -m host_server`, Calibration → IMU), over
+the always-on control channel (`control_link.c`; see `docs/architecture.md` "Control
+channel"). Either way it calls `imu_run_hw_foc_calibration()`
+(`firmware/data_capture/main/imu.c`). Procedure:
 
 1. **Guided gravity-axis selection** (`state_machine.c:select_gravity_axis()`).
    `bmi2_perform_accel_foc` has no way to detect the rig's orientation itself
@@ -64,6 +65,36 @@ Notes / known simplifications:
   into the FOC call itself.
 - Gyro FOC only needs stillness (no orientation dependency).
 
+## IMU hardware presence (implemented, unverified against a real IMU)
+
+The rig this was built against currently has **no IMU physically connected**, and the
+firmware used to hard-code that as a compile-time toggle (`CONFIG_ENABLE_IMU=0`) — which
+also meant a genuinely-missing chip on a build that *did* compile IMU support in would abort
+boot entirely (`imu_init()` failing was fatal in `app_main()`). Both are now runtime,
+non-fatal:
+
+- `imu_init()` (`data_capture.c`) is always attempted at boot. If the BMI270 doesn't ACK on
+  I2C or its init sequence fails, `imu.c` logs `"BMI270 IMU sensor not found ... —
+  continuing without IMU"` and boot proceeds normally — verified on this exact hardware
+  (the I2C scan finding nothing is the expected, exercised path here, not a hypothetical).
+- `imu_available()` (`imu.h`) reports the result for the rest of the app's lifetime:
+  `imu_pipeline_start()` refuses (`ESP_ERR_INVALID_STATE`) when it's false,
+  `IMU_CALIBRATION` logs "unavailable" and no-ops instead of running FOC, and streaming's
+  `include_imu` request (`set_state`'s `include_imu` field, see `docs/architecture.md`
+  "Commands / states") only actually starts the IMU pipeline when both hardware is present
+  and the operator asked for it. `get_status`/the browser page's status panel report
+  `imu_available` directly, and the "include IMU" checkbox is disabled with a "no IMU sensor
+  found" note when it's false.
+- `CONFIG_ENABLE_IMU` (`config.h`) still exists, but as a coarser, purely compile-time knob
+  ("build IMU support into the firmware at all") — on by default now. It's unrelated to
+  whether a chip is actually detected; leave it on unless deliberately building an
+  IMU-code-free binary (e.g. to isolate camera-only performance).
+
+**Not yet verified**: the *success* path (IMU actually present, streamed, calibrated) has no
+real hardware to test against right now — the graceful-*absence* path above is what's
+actually been exercised. If IMU hardware gets wired up, re-check `imu_pipeline_start()`'s
+consumer tasks (`net_client.c`/`tcp_client.c`/`sdcard.c`, unchanged by this pass) end-to-end.
+
 ## Future work (not yet implemented)
 
 These need long stationary logs (30min-3hr+) and are analysis, not something
@@ -90,9 +121,10 @@ camera_calibration) rather than reinventing them on-device.
 ## Camera calibration and ISP tuning (implemented)
 
 Checkerboard intrinsics (burst/auto capture with on-the-fly solve, offline re-solve) and the ten
-OV5640 tuning steps from the playbook are driven from the host with
-`python -m host_server.calibration run` while the device is in `CAMERA_CALIBRATION` (entered via
-serial command `5`, or `set_state camera_calibration` over the control channel — see
+OV5640 tuning steps from the playbook are driven from the one host page
+(`python -m host_server`'s Calibration panel) or its terminal-client equivalent
+(`python -m host_server.calibration run`) while the device is in `CAMERA_CALIBRATION` (entered
+via serial command `5`, or `set_state camera_calibration` over the control channel — see
 `docs/architecture.md` "Control channel"). Tuned registers can be persisted to the device (NVS,
-survives reboot) with `cli.py`'s `save` command. See
+survives reboot) with the `save` command. See
 [camera_calibration_and_tuning.md](camera_calibration_and_tuning.md).
