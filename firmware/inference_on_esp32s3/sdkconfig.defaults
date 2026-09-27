@@ -1,0 +1,32 @@
+# Applied only when sdkconfig doesn't exist yet (delete sdkconfig to re-apply).
+# Mirrors esp-dl's own esp32s3 example defaults + this project's board facts.
+CONFIG_IDF_TARGET="esp32s3"
+
+# 8MB flash, custom partition table (see partitions.csv)
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+
+# Octal PSRAM @ 80MHz -- this board's PSRAM; wrong mode = boot crash.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+
+# Speed: inference is compute/memory bound.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+
+CONFIG_ESP_SYSTEM_ALLOW_RTC_FAST_MEM_AS_HEAP=n
+CONFIG_FATFS_LFN_HEAP=y
+
+# Model location for esp-dl's hand_detect component:
+#   rodata (default): model is baked into the app image -> `idf.py flash` pushes it, no SD card.
+#   To load from the SD card instead, run `idf.py menuconfig` ->
+#   "models: hand_detect" -> model location -> sdcard. See docs/inference_on_esp32s3.md.
+CONFIG_HAND_DETECT_MODEL_IN_FLASH_RODATA=y

@@ -1,0 +1,8 @@
+## IDF Component Manager Manifest File
+dependencies:
+  idf:
+    version: '>=5.3.0'
+  espressif/esp32-camera: '*'
+  # esp-dl model component: pulls in the esp-dl runtime and packs
+  # models/s3/espdet_pico_224_224_hand.espdl into the firmware image.
+  espressif/hand_detect: '~0.2.0'

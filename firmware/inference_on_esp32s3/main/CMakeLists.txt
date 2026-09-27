@@ -1,0 +1,11 @@
+idf_component_register(
+    SRCS
+        "inference_on_esp32s3.cpp"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        esp_timer
+        fatfs
+        sdmmc
+        driver
+)

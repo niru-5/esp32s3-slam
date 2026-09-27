@@ -2,9 +2,9 @@
 set -eo pipefail
 
 # Build one of the ESP32-S3 firmware projects.
-# Usage: build.sh <data_capture|imu_testing>
+# Usage: build.sh <data_capture|imu_testing|inference_on_esp32s3>
 
-PROJECT="${1:?usage: build.sh <data_capture|imu_testing>}"
+PROJECT="${1:?usage: build.sh <data_capture|imu_testing|inference_on_esp32s3>}"
 IDF_ENV="$HOME/.espressif/tools/activate_idf_v5.3.5.sh"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 PROJ_DIR="$REPO_ROOT/firmware/$PROJECT"
