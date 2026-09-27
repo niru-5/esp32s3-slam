@@ -28,6 +28,14 @@ class LiveView:
         self.jpeg: bytes = b""
         self.text = "waiting for the first frame..."
         self.version = 0
+        # Parallel "before" snapshot: one frame captured at the start of a `tune` step,
+        # before its register changes are applied (see tuning.py Tuner._snapshot_before),
+        # so the browser can show before/after side by side instead of only ever the latest
+        # (post-change) frame. Independent buffer/version from the main jpeg/text/version
+        # above -- updating one never touches the other.
+        self.before_jpeg: bytes = b""
+        self.before_text = "no before picture yet"
+        self.before_version = 0
         self._lock = threading.Lock()
         self._srv = None
         if port:
@@ -69,6 +77,25 @@ class LiveView:
                 self.text = text
 
     def update_bgr(self, img, text: str | None = None, max_w: int = 960) -> None:
+        buf = self._encode(img, max_w)
+        if buf is not None:
+            self.update(buf, text)
+
+    def update_before(self, jpeg: bytes | None = None, text: str | None = None) -> None:
+        with self._lock:
+            if jpeg is not None:
+                self.before_jpeg = jpeg
+                self.before_version += 1
+            if text is not None:
+                self.before_text = text
+
+    def update_before_bgr(self, img, text: str | None = None, max_w: int = 960) -> None:
+        buf = self._encode(img, max_w)
+        if buf is not None:
+            self.update_before(buf, text)
+
+    @staticmethod
+    def _encode(img, max_w: int) -> bytes | None:
         import cv2
         if img.ndim == 2:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
@@ -76,8 +103,7 @@ class LiveView:
             s = max_w / img.shape[1]
             img = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
         ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        if ok:
-            self.update(buf.tobytes(), text)
+        return buf.tobytes() if ok else None
 
     def close(self) -> None:
         if self._srv:

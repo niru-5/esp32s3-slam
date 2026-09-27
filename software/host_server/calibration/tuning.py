@@ -219,7 +219,7 @@ def _dark_grid(c: Ctx) -> dict:
                 c.regs.freeze_loops(e, g, awb_gains=None)
                 imgs = c.capture(6, flush=4, full_regs=(e == exps[1] and g == gains[0]))
                 raw = an.average_frames(c.frames(imgs))
-                st = an.plane_stats(raw)
+                st = an.plane_stats(raw, mirror=c.regs.mirror, flip=c.regs.flip)
                 means = {k: v["mean"] for k, v in st.items()}
                 c.dark_check(float(np.mean(list(means.values()))), 30.0 if e <= 100 else 60.0)
                 c.metrics(**{f"mean_{k}": round(v, 2) for k, v in means.items()},
@@ -239,7 +239,7 @@ def step_black_level(c: Ctx) -> None:
         c.regs.freeze_loops(100, 0x10, awb_gains=None)
         c.regs.set_bits(0x4000, 0x01, 0x00)
         imgs = c.capture(6, flush=4, full_regs=True)
-        st = an.plane_stats(an.average_frames(c.frames(imgs)))
+        st = an.plane_stats(an.average_frames(c.frames(imgs)), mirror=c.regs.mirror, flip=c.regs.flip)
         c.metrics(**{f"mean_{k}": round(v["mean"], 2) for k, v in st.items()})
     # dark current slope at 1x: DN per row-time
     xs = [e for (e, g) in res if g == 0x10]
@@ -257,7 +257,7 @@ def step_lens_shading(c: Ctx) -> None:
         c.say(f"      frozen at exposure={e} rows, gain={g:.2f}x")
         imgs = c.capture(int(c.opt("n", 16)), flush=4, full_regs=True)
         raw = an.average_frames(c.frames(imgs))
-        planes = an.bayer_planes(raw)
+        planes = an.bayer_planes(raw, mirror=c.regs.mirror, flip=c.regs.flip)
         g_plane = (planes["Gr"] + planes["Gb"]) / 2
         import cv2
         blur = cv2.GaussianBlur(g_plane, (0, 0), max(g_plane.shape) / 40)
@@ -303,7 +303,7 @@ def step_awb(c: Ctx) -> None:
         c.freeze_current(awb=None)
         imgs = c.capture(8, flush=3)
         raw = an.average_frames(c.frames(imgs))
-        pl = an.bayer_planes(an.center_patch(raw, 0.3))
+        pl = an.bayer_planes(an.center_patch(raw, 0.3), mirror=c.regs.mirror, flip=c.regs.flip)
         r_m, b_m = pl["R"].mean(), pl["B"].mean()
         g_m = (pl["Gr"].mean() + pl["Gb"].mean()) / 2
         gr, gb = g_m / r_m, g_m / b_m
@@ -525,12 +525,31 @@ class Tuner:
             return
         self.run(STEPS[a[0]], a[1:])
 
+    def _snapshot_before(self, step: Step) -> None:
+        """One frame, captured before this step touches any register, for the browser's
+        before/after comparison (LiveView.before_* / GET /calib/before.jpg) -- the running
+        `show()`/live picture already ends up showing the *after* state once the step's
+        variants run, so this is the only place the "before" side needs to be grabbed.
+        Best-effort: a capture hiccup here shouldn't abort the tuning step itself."""
+        try:
+            r = self.app.link.call("capture", timeout=15, n=1, flush=3, regs="none", tag=f"{step.key}_before")
+            if not r.ok or not r.images:
+                return
+            img = decode(r.images[0])
+            if img.ndim == 2:      # raw8: debayer (oriented per the sensor's current mirror/
+                                    # flip) so "before" is a real picture, not a grey Bayer mosaic
+                img = an.debayer(img, mirror=self.app.regs.mirror, flip=self.app.regs.flip)
+            self.app.view.update_before_bgr(img, f"{step.key}: before")
+        except Exception as exc:
+            self.app.out(f"  (before-picture capture skipped: {exc})")
+
     def run(self, step: Step, rest: list[str]) -> None:
         out = self.app.out
         yes, keep = "--yes" in rest, "--keep" in rest
         opts = dict(kv.split("=", 1) for kv in rest if "=" in kv)
         out(f"\n=== {step.title} ===")
         before = self.app.backup(f"{step.key}_before_{time.strftime('%H%M%S')}")
+        self._snapshot_before(step)
         out(f"\nSET UP: {step.setup}")
         out(f"EXPECT: {step.expect}\n")
         if not yes:

@@ -65,6 +65,7 @@ class FakeDevice:
         self.stop = threading.Event()
         self.exit_requested = False
         self.captured = 0
+        self.received: list[str] = []
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
@@ -108,6 +109,7 @@ class FakeDevice:
     # -- commands --------------------------------------------------------------
     def _handle(self, conn, req) -> bool:
         cmd, rid = req["cmd"], req["id"]
+        self.received.append(cmd)
         ok = lambda **kv: self._send_json(conn, {"id": rid, "ok": True, **kv})
         if cmd == "ping":
             ok()
@@ -138,7 +140,11 @@ class FakeDevice:
             o20, o21 = self.regs[0x3820], self.regs[0x3821]
             self.regs[0x3820] = (o20 & ~6) | (6 if req["flip"] else 0)
             self.regs[0x3821] = (o21 & ~6) | (6 if req["mirror"] else 0)
-            ok(old_3820=o20, old_3821=o21, new_3820=self.regs[0x3820], new_3821=self.regs[0x3821], new_4514=0)
+            # 0x4514/0x4520 aren't modelled here (this fake doesn't simulate the BLC-line
+            # fixups the real driver applies) -- old==new so RegisterBank.set_orientation()
+            # correctly logs no undo/save entry for them, same as a no-op write would.
+            ok(old_3820=o20, old_3821=o21, new_3820=self.regs[0x3820], new_3821=self.regs[0x3821],
+               old_4514=0, new_4514=0, old_4520=0, new_4520=0)
         elif cmd == "fps_probe":
             ok(ts=[int(i * 45000) for i in range(req.get("n", 30))])
         elif cmd == "capture":

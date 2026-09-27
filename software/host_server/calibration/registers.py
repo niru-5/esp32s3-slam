@@ -32,6 +32,12 @@ class RegisterBank:
         self.link = link
         # (addr, old_byte, new_byte) in application order.
         self.undo_log: list[tuple[int, int, int]] = []
+        # Current sensor readout orientation, as last confirmed by set_orientation() -- the
+        # source of truth for analysis.py's oriented Bayer-tile helpers (bayer_planes/
+        # plane_stats/debayer) and for re-applying orientation after a mode switch resets it
+        # (see cli.py App.set_mode()). Device default on boot/mode-switch is mirror=flip=False.
+        self.mirror = False
+        self.flip = False
 
     # -- reads -------------------------------------------------------------
     def read(self, addr: int, count: int = 1) -> bytes:
@@ -80,9 +86,15 @@ class RegisterBank:
         r = self.link.call("set_orientation", mirror=int(mirror), flip=int(flip))
         if not r.ok:
             raise RegisterError(r.data.get("err", "set_orientation failed"))
-        for a, k in ((0x3820, "3820"), (0x3821, "3821")):
-            if r.data["old_" + k] != r.data["new_" + k]:
+        # 0x3820/0x3821 (mirror/flip control bits) plus 0x4514/0x4520 (BLC readout-direction
+        # fixups the driver also touches, see control_link.c cmd_set_orientation) -- all four
+        # need to land in undo_log so `save --apply` persists the full orientation-dependent
+        # register set, not just the two direct control bits. Older firmware without
+        # old_4514/old_4520 in its reply (pre this fix) just won't have those keys; skip them.
+        for a, k in ((0x3820, "3820"), (0x3821, "3821"), (0x4514, "4514"), (0x4520, "4520")):
+            if "old_" + k in r.data and r.data["old_" + k] != r.data["new_" + k]:
                 self.undo_log.append((a, r.data["old_" + k], r.data["new_" + k]))
+        self.mirror, self.flip = bool(mirror), bool(flip)
         return r.data
 
     # -- undo / restore ----------------------------------------------------

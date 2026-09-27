@@ -5,17 +5,45 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-# OV5640 RAW default readout ("Normal" row of the playbook's Bayer-phase table):
-# first 2x2 tile seen by the ISP is  B G / G R.
+# OV5640 RAW default readout ("Normal" row of the playbook's Bayer-phase table, mirror=flip=
+# False): first 2x2 tile seen by the ISP is  B G / G R.
 BAYER_NAMES = {(0, 0): "B", (0, 1): "Gb", (1, 0): "Gr", (1, 1): "R"}
 
+# Canonical OpenCV Bayer code per tile, keyed by the tile's second-row pair -- see
+# oriented_debayer_code() for why it's indexed this way (OpenCV's naming quirk).
+_CV_BAYER_CODES = {
+    "RG": cv2.COLOR_BayerRG2BGR, "GR": cv2.COLOR_BayerGR2BGR,
+    "BG": cv2.COLOR_BayerBG2BGR, "GB": cv2.COLOR_BayerGB2BGR,
+}
 
-def debayer(raw: np.ndarray) -> np.ndarray:
-    """Preview demosaic for the OV5640's normal readout (B G / G R tile).
 
-    OpenCV names Bayer codes by the *second* row/column, so this tile is COLOR_BayerRG2BGR
-    -- verified on this module: BayerBG2BGR swaps red and blue on a warm-lit scene."""
-    return cv2.cvtColor(raw, cv2.COLOR_BayerRG2BGR)
+def oriented_bayer_names(mirror: bool = False, flip: bool = False) -> dict[tuple[int, int], str]:
+    """BAYER_NAMES for the sensor's *current* mirror/flip (see RegisterBank.mirror/.flip, set
+    by `orient` / set_orientation over the control link, and control_link.c's
+    cmd_set_orientation). Mirroring/flipping the OV5640's readout doesn't change the physical
+    color filter tile, but does change which pixel comes out first -- so which color lands at
+    2x2 offset (i, j) shifts too. Position (i, j) under (mirror, flip) holds whatever the
+    *default* readout has at (i ^ flip, j ^ mirror): flip reverses row order, mirror reverses
+    column order. mirror=flip=False reproduces BAYER_NAMES exactly."""
+    return {(i, j): BAYER_NAMES[(i ^ int(flip), j ^ int(mirror))] for i in (0, 1) for j in (0, 1)}
+
+
+def oriented_debayer_code(mirror: bool = False, flip: bool = False) -> int:
+    """The cv2.COLOR_Bayer*2BGR code matching the sensor's current mirror/flip.
+
+    OpenCV names Bayer codes by the tile's *second* row (verified on this module: for the
+    default B G / G R tile, COLOR_BayerRG2BGR is correct -- COLOR_BayerBG2BGR swaps red and
+    blue on a warm-lit scene), so the code's two letters are the second-row pair read
+    right-to-left: tile[(1,1)] then tile[(1,0)]."""
+    names = oriented_bayer_names(mirror, flip)
+    return _CV_BAYER_CODES[names[(1, 1)][0] + names[(1, 0)][0]]
+
+
+def debayer(raw: np.ndarray, mirror: bool = False, flip: bool = False) -> np.ndarray:
+    """Preview demosaic, oriented for the sensor's current mirror/flip (default: the OV5640's
+    normal B G / G R readout). Pass the RegisterBank's tracked mirror/flip, not just the
+    default, once orientation has been changed -- see oriented_debayer_code()."""
+    return cv2.cvtColor(raw, oriented_debayer_code(mirror, flip))
 
 
 def raw_geometry_ok(raw: np.ndarray, min_corr: float = 0.5) -> bool:
@@ -31,13 +59,14 @@ def raw_geometry_ok(raw: np.ndarray, min_corr: float = 0.5) -> bool:
     return float(np.corrcoef(a, b)[0, 1]) > min_corr
 
 
-def bayer_planes(raw: np.ndarray, names=BAYER_NAMES) -> dict[str, np.ndarray]:
+def bayer_planes(raw: np.ndarray, mirror: bool = False, flip: bool = False) -> dict[str, np.ndarray]:
+    names = oriented_bayer_names(mirror, flip)
     return {n: raw[i::2, j::2].astype(np.float64) for (i, j), n in names.items()}
 
 
-def plane_stats(raw: np.ndarray) -> dict[str, dict]:
+def plane_stats(raw: np.ndarray, mirror: bool = False, flip: bool = False) -> dict[str, dict]:
     out = {}
-    for n, p in bayer_planes(raw).items():
+    for n, p in bayer_planes(raw, mirror, flip).items():
         out[n] = {"mean": float(p.mean()), "std": float(p.std()),
                   "zero_frac": float((p == 0).mean()), "sat_frac": float((p >= 255).mean())}
     return out

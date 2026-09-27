@@ -12,6 +12,8 @@ docs/camera_calibration_and_tuning.md.
                               pseudo-commands below
 
     GET  /calib/live.jpg      latest calibration-session capture (LiveView's buffer)
+    GET  /calib/before.jpg    the tuning step's "before" snapshot (LiveView's before_* buffer;
+                              see tuning.py Tuner._snapshot_before) -- for before/after compare
     GET  /calib/output.json   {"lines": [...], "next": N, "busy": bool} -- poll with
                               ?since=<next from the previous poll>
     POST /calib/line          {"line": "..."} -- run one cli.py command (reg/regw/tune/
@@ -319,6 +321,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             view = s.calib.view
             jpeg = view.jpeg if view else b""
             self._send_bytes(jpeg, "image/jpeg")
+        elif path.startswith("/calib/before.jpg"):
+            view = s.calib.view
+            jpeg = view.before_jpeg if view else b""
+            self._send_bytes(jpeg, "image/jpeg")
         elif path.startswith("/calib/output.json"):
             self._calib_output(s)
         else:
@@ -346,7 +352,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _calib_output(self, s: Server) -> None:
         if s.calib.console is None:
             self._send_json({"lines": [], "next": 0, "busy": False, "active": False,
-                             "live_version": 0, "live_text": ""})
+                             "live_version": 0, "live_text": "",
+                             "before_version": 0, "before_text": ""})
             return
         qs = self.path.split("?", 1)
         since = 0
@@ -362,7 +369,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self._send_json({"lines": lines, "next": nxt, "busy": s.calib.console.busy,
                          "waiting_for_answer": s.calib.console.waiting_for_answer, "active": True,
                          "live_version": view.version if view else 0,
-                         "live_text": view.text if view else ""})
+                         "live_text": view.text if view else "",
+                         "before_version": view.before_version if view else 0,
+                         "before_text": view.before_text if view else ""})
 
     # -- POST ----------------------------------------------------------------
     def do_POST(self):

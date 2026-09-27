@@ -77,6 +77,34 @@ class RawGeometry(unittest.TestCase):
         self.assertTrue(an.raw_geometry_ok(dark))
 
 
+class OrientedAnalysis(unittest.TestCase):
+    """analysis.py's oriented Bayer-tile helpers -- what actually fixes the "debayer error
+    after `orient`" report: bayer_planes/plane_stats/debayer must track the sensor's current
+    mirror/flip (RegisterBank.mirror/.flip), not just assume the unmirrored/unflipped default."""
+
+    def test_default_orientation_matches_bayer_names(self):
+        from host_server.calibration import analysis as an
+        self.assertEqual(an.oriented_bayer_names(False, False), an.BAYER_NAMES)
+        self.assertEqual(an.oriented_debayer_code(False, False), cv2.COLOR_BayerRG2BGR)
+
+    def test_all_four_orientations_are_distinct_codes(self):
+        from host_server.calibration import analysis as an
+        codes = {an.oriented_debayer_code(m, f) for m in (False, True) for f in (False, True)}
+        self.assertEqual(len(codes), 4)
+
+    def test_bayer_planes_follows_mirror(self):
+        from host_server.calibration import analysis as an
+        raw = np.zeros((4, 4), np.uint8)
+        raw[0::2, 0::2], raw[0::2, 1::2] = 10, 20   # default (0,0)="B", (0,1)="Gb"
+        raw[1::2, 0::2], raw[1::2, 1::2] = 30, 40   # default (1,0)="Gr", (1,1)="R"
+        default = an.bayer_planes(raw)
+        self.assertTrue((default["B"] == 10).all() and (default["R"] == 40).all())
+        # mirroring reverses column order: what the default readout calls "Gb" (col 1) is
+        # what a mirrored readout now sees first (col 0), i.e. as "B".
+        mirrored = an.bayer_planes(raw, mirror=True)
+        self.assertTrue((mirrored["B"] == 20).all() and (mirrored["R"] == 30).all())
+
+
 class WithFakeDevice(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -137,6 +165,33 @@ class WithFakeDevice(unittest.TestCase):
         self.assertEqual(self.dev.regs[0x3503], before[0x3503])
         self.assertEqual(self.dev.regs[0x3820], before[0x3820])
         self.assertEqual(self.dev.regs[0x3821], before[0x3821])
+
+    def test_set_orientation_tracks_mirror_flip(self):
+        """RegisterBank.mirror/.flip is the source of truth analysis.py's oriented Bayer
+        helpers (bayer_planes/plane_stats/debayer) and App.set_mode()'s reapply-after-reset
+        both read -- must reflect the last orientation actually requested."""
+        self.assertEqual((self.app.regs.mirror, self.app.regs.flip), (False, False))
+        self.app.regs.set_orientation(True, False)
+        self.assertEqual((self.app.regs.mirror, self.app.regs.flip), (True, False))
+        self.app.regs.set_orientation(False, True)
+        self.assertEqual((self.app.regs.mirror, self.app.regs.flip), (False, True))
+
+    def test_set_mode_reapplies_orientation(self):
+        """A mode switch resets every register on the device, including orientation -- see
+        control_link.c camera_init_ex. App.set_mode() must reissue set_orientation() so it
+        doesn't silently revert (this was the bug behind the user's debayer-error report)."""
+        self.app.regs.set_orientation(True, True)
+        self.dev.received.clear()
+        self.app.set_mode("raw8", "hd")
+        self.assertIn("set_orientation", self.dev.received)
+        # still tracked correctly afterwards, not reset to the (now stale) default
+        self.assertEqual((self.app.regs.mirror, self.app.regs.flip), (True, True))
+
+    def test_set_mode_skips_reapply_at_default_orientation(self):
+        """No orientation was ever set (still mirror=flip=False) -- nothing to reapply."""
+        self.dev.received.clear()
+        self.app.set_mode("raw8", "hd")
+        self.assertNotIn("set_orientation", self.dev.received)
 
     def test_freeze_loops_writes_exposure_and_gain(self):
         self.app.regs.freeze_loops(exposure_rows=300, gain_x16=0x40)

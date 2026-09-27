@@ -124,7 +124,8 @@ class FakeControlDevice:
             self._send({"id": rid, "ok": True, "regs": total, "ms": 1})
         elif cmd == "set_orientation":
             self._send({"id": rid, "ok": True, "old_3820": 0, "old_3821": 0,
-                       "new_3820": 0, "new_3821": 0, "new_4514": 0})
+                       "new_3820": 0, "new_3821": 0, "old_4514": 0, "new_4514": 0,
+                       "old_4520": 0, "new_4520": 0})
         elif cmd == "fps_probe":
             self._send({"id": rid, "ok": True, "ts": [0, 40000, 80000]})
         elif cmd == "capture":

@@ -45,10 +45,13 @@ cd software && .venv/bin/python -m host_server
 The browser page's Calibration panel is the primary way in: click "Camera", which puts the
 device into `CAMERA_CALIBRATION` and starts a session (`software/calib_data/<timestamp>/`,
 **backs up all 12 288 sensor registers** to `settings/00_startup.json`, ~9 s). From there you
-get a live capture image, a "Capture single image" button, quick-launch buttons for the ISP
-tuning steps and intrinsics capture, save/save-status/save-clear buttons, and a command
-console that runs any of the commands below (`reg`, `regw`, `tune <step>`, `cal ...`,
-everything in `help`'s output) with live output.
+get **before/after images side by side** (a `tune <step>` run captures one frame right before
+touching any register as "Before"; the panel's usual live/capture image doubles as "After"
+once the step's variants start landing — `GET /calib/before.jpg` and `/calib/live.jpg`,
+independent buffers/versions in `LiveView`, both polled off `/calib/output.json`), a "Capture
+single image" button, quick-launch buttons for the ISP tuning steps and intrinsics capture,
+save/save-status/save-clear buttons, and a command console that runs any of the commands below
+(`reg`, `regw`, `tune <step>`, `cal ...`, everything in `help`'s output) with live output.
 
 **Prefer a terminal?** `cli.py` (`host_server.calibration run`) is the exact same session, as
 a client instead of a browser tab — it does not own its own device connection anymore, it
@@ -168,7 +171,7 @@ existing command set, valid only while `CAMERA_CALIBRATION` is active).
 ## Firmware side (`control_link.c`, camera reconfigure in `cam_calib.c`)
 
 * Entered with serial `5` or `set_state camera_calibration` over the control channel (`state_machine.c`; see `docs/architecture.md` "Control channel"), streaming pipelines are torn down first; `cam_calib_enter_mode()` re-initialises the camera as JPEG SVGA, quality 6, 2 frame buffers, *grab latest* — synchronously, no separate task. Leaving the mode (`exit`, serial `3`) calls `cam_calib_exit_mode()`, restoring the normal streaming camera config (and re-applying any saved register overrides, see "Persisting tuned registers").
-* Wire format: `uint32 len | uint8 type | body`, type `0x01` JSON (both ways), `0x02` IMAGE (`uint32 meta_len | meta JSON | frame bytes`) — all on `control_link.c`'s one always-on socket, gated on `CAMERA_CALIBRATION` being the active state. Commands: `ping`, `info`, `set_mode {format,framesize,quality,fb_count}`, `reg_read`, `reg_write {writes:[{a,v,m}]}` (replies old/new bytes → undo log), `reg_dump {ranges}`, `set_orientation {mirror,flip}` (through the driver, which also fixes the 0x4514 black-level-line registers), `capture {n,interval_ms,flush,regs,tag}`, `fps_probe {n}`, `save_camera_regs {writes:[{a,v}]}`, `clear_camera_regs`, `get_camera_overrides`, `exit`.
+* Wire format: `uint32 len | uint8 type | body`, type `0x01` JSON (both ways), `0x02` IMAGE (`uint32 meta_len | meta JSON | frame bytes`) — all on `control_link.c`'s one always-on socket, gated on `CAMERA_CALIBRATION` being the active state. Commands: `ping`, `info`, `set_mode {format,framesize,quality,fb_count}`, `reg_read`, `reg_write {writes:[{a,v,m}]}` (replies old/new bytes → undo log), `reg_dump {ranges}`, `set_orientation {mirror,flip}` (through the driver, which also fixes the 0x4514/0x4520 black-level-line registers — the reply reports old/new for all four registers, `0x3820`/`0x3821`/`0x4514`/`0x4520`, so `save`'s undo-log tracking covers the full orientation-dependent set, not just the two direct control bits), `capture {n,interval_ms,flush,regs,tag}`, `fps_probe {n}`, `save_camera_regs {writes:[{a,v}]}`, `clear_camera_regs`, `get_camera_overrides`, `exit`.
 * Formats: `jpeg`, `raw8`, `gray`, `rgb565`, `yuv422`. **RAW8** — the ESP32-S3 camera driver has no RAW path, so the sensor is brought up as GRAYSCALE (1 byte/pixel) and then `0x501F=0x03`, `0x4300=0x00` switch the OV5640 to Bayer output. It is the **top 8 of 10 bits** (a DN step is 4× the sensor's own black-level resolution) and it **bypasses the ISP scaler**, so only native readouts are coherent: `hd` (1280×720, the default for raw steps) and `vga` (640×480). At svga/xga/sxga the rows come out scrambled (the stream is really 1280 pixels wide); the tool warns when it sees this (it stays quiet on dark/flat frames, where there is nothing to measure).
 * A mode switch needs a ~32 KB contiguous internal-DRAM block for the camera DMA buffer, so the command/TX buffers are allocated in PSRAM.
 * The IMU is not part of this mode (camera–IMU extrinsics are a separate calibration). Whether IMU hardware is present at all is now a runtime fact (`imu_available()`, see `docs/calibration.md`), not a compile-time toggle — irrelevant here either way.
@@ -177,6 +180,18 @@ existing command set, valid only while `CAMERA_CALIBRATION` is active).
 
 * Sensor PID 0x5640; SVGA JPEG runs **HTS 2060, VTS 984, 22.20 fps (±0.4 ms), PCLK 45 MHz, t_row 45.8 µs**. The stored banding steps (B50 = 295, B60 = 246, the 5 MP defaults) are **stale for this mode**: this row time needs B50 ≈ 218, B60 ≈ 182 — step 10 recomputes them.
 * Bayer tile in normal orientation is **B G / G R** (confirmed against the JPEG colours); demosaic with `cv2.COLOR_BayerRG2BGR` (OpenCV names the code by the second row/column).
+* Mirroring/flipping the readout shifts which 2×2 offset holds which color, since the tile
+  itself doesn't move but which pixel comes out first does. `analysis.py`'s
+  `oriented_bayer_names(mirror, flip)`/`oriented_debayer_code(mirror, flip)` compute the
+  shifted tile / matching cv2 code (`bayer_planes`, `plane_stats`, `debayer` all take
+  `mirror`/`flip` now, default `False`/`False` = the table above); `RegisterBank.mirror`/
+  `.flip` (set by `set_orientation`/`orient`) is the source of truth every raw8-based tuning
+  step (`black_level`, `lens_shading`, `awb`) reads it from. A mode switch
+  (`camera_init_ex`, i.e. any `ensure_mode`/`set_mode` call) resets *every* register including
+  orientation, so `App.set_mode()` reapplies the tracked mirror/flip right after — without
+  this, orientation silently reverted to default on the very next tuning step and desynced
+  the analysis code from the sensor's actual readout, producing wrong plane stats / a
+  swapped-color debayer preview after `orient`.
 * RAW8 black level reads exactly 4.0 DN in all four planes at short exposure (BLC target 0x10 at 10 bit ÷ 4), std ≈ 0.01 DN.
 * `set_orientation` produces `0x3820[2:1]` / `0x3821[2:1]` as the playbook describes.
 * The module is mounted rotated ≈90°, which mirror/flip cannot correct (only 180° via mirror+flip).

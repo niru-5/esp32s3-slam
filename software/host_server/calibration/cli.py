@@ -132,6 +132,13 @@ class App:
             raise RegisterError(r.data.get("err", "set_mode failed"))
         self.mode = {"fmt": r.data["fmt"], "size": r.data["size"]}
         self.regs.undo_log.clear()      # a re-init resets every register: the log no longer applies
+        if self.regs.mirror or self.regs.flip:
+            # camera_init_ex() resets orientation too (0x3820/0x3821/0x4514/0x4520 all go back
+            # to the sensor default) -- reapply what `orient` last set so it doesn't silently
+            # revert on the next tune/cal step's ensure_mode() call. Without this, analysis.py's
+            # oriented Bayer-plane helpers would be given the RegisterBank's still-correct
+            # mirror/flip while the sensor itself had quietly gone back to unmirrored/unflipped.
+            self.regs.set_orientation(self.regs.mirror, self.regs.flip)
         self.session.log("set_mode", **self.mode)
         return r.data
 
@@ -278,6 +285,9 @@ class App:
         """orient <mirror 0|1> <flip 0|1>: set through the driver, capture one JPEG to look at."""
         d = self.regs.set_orientation(bool(int(a[0])), bool(int(a[1])))
         self.out(f"0x3820 {d['old_3820']:#04x}->{d['new_3820']:#04x}   0x3821 {d['old_3821']:#04x}->{d['new_3821']:#04x}")
+        if "old_4514" in d and (d["old_4514"] != d["new_4514"] or d.get("old_4520") != d.get("new_4520")):
+            self.out(f"0x4514 {d['old_4514']:#04x}->{d['new_4514']:#04x}   "
+                     f"0x4520 {d.get('old_4520', 0):#04x}->{d.get('new_4520', 0):#04x}  (BLC readout-direction fixup)")
         r = self.link.call("capture", n=1, flush=5, regs="none", tag="orient")
         if r.images and r.images[0].meta["fmt"] == "jpeg":
             p = self.session.save_image(self.session.path("captures", "orient", "x").parent,

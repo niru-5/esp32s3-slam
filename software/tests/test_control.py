@@ -124,6 +124,11 @@ class ServerWithFakeDevice(unittest.TestCase):
         out = _get(self.http_port, "/calib/output.json?since=0")
         self.assertTrue(out["active"])
         self.assertTrue(any("backing up all sensor registers" in line for line in out["lines"]))
+        # before/after picture feature: fields present from the start (no tune step has run
+        # yet, so before_version is still 0), and the endpoint itself is reachable.
+        self.assertEqual(out["before_version"], 0)
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.http_port}/calib/before.jpg", timeout=5) as resp:
+            self.assertEqual(resp.status, 200)
 
         r = _post(self.http_port, "/calib/line", {"line": "info"})
         self.assertTrue(r["ok"])

@@ -45,6 +45,9 @@
   .banner.ok   { background: #1f3b2a; color: #63d2a3; }
   .frame { background: #000; border: 1px solid #23262b; border-radius: 8px; overflow: hidden; margin-bottom: 12px; }
   .frame img { display: block; width: 100%; height: auto; }
+  .imgpair { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
+  .imgpair > div { flex: 1 1 240px; min-width: 160px; }
+  .imgpair .frame { margin-bottom: 4px; }
   .axisgrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; max-width: 300px; }
   .steps { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
   .console { background: #0a0c0e; border: 1px solid #23262b; border-radius: 6px; padding: 8px;
@@ -113,7 +116,16 @@
         </div>
 
         <div id="camera-sub" style="display:none">
-          <div class="frame"><img id="calib_img" alt="calibration capture" src="/calib/live.jpg"></div>
+          <div class="imgpair">
+            <div>
+              <div class="muted">Before</div>
+              <div class="frame"><img id="calib_before_img" alt="before picture" src="/calib/before.jpg"></div>
+            </div>
+            <div>
+              <div class="muted">Live / After</div>
+              <div class="frame"><img id="calib_img" alt="calibration capture" src="/calib/live.jpg"></div>
+            </div>
+          </div>
           <div class="row">
             <button id="capture-single" class="sm">Capture single image</button>
             <button id="save-apply" class="sm">Save tuned registers</button>
@@ -301,6 +313,7 @@ async function pollCalib() {
       ? "press Enter (or type q to skip)…" : "calib> help";
     for (const line of j.lines) consoleLine(line, line.startsWith("calib>") ? "prompt" : "");
     document.getElementById("calib_img").src = "/calib/live.jpg?v=" + j.live_version;
+    document.getElementById("calib_before_img").src = "/calib/before.jpg?v=" + j.before_version;
   } catch (e) { /* ignore transient errors */ }
 }
 

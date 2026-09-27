@@ -382,11 +382,18 @@ static esp_err_t cmd_set_orientation(int id, const cJSON *req) {
     if (!s) return reply_err(id, "no sensor");
     int mirror, flip;
     if (!json_int(req, "mirror", &mirror) || !json_int(req, "flip", &flip)) return reply_err(id, "need mirror and flip");
+    // Old values for every register the driver may touch, not just 0x3820/0x3821 -- the host
+    // (RegisterBank.set_orientation) diffs these into its undo log / `save` candidate list, and
+    // an old==new register is skipped there, so under-reporting old_* here would silently drop
+    // 0x4514/0x4520 from `save --apply` even though set_hmirror/set_vflip changed them too.
     int old20 = reg_get(0x3820), old21 = reg_get(0x3821);
+    int old4514 = reg_get(0x4514), old4520 = reg_get(0x4520);
     s->set_hmirror(s, mirror ? 1 : 0);
     s->set_vflip(s, flip ? 1 : 0);
-    return send_jsonf("{\"id\":%d,\"ok\":true,\"old_3820\":%d,\"old_3821\":%d,\"new_3820\":%d,\"new_3821\":%d,\"new_4514\":%d}",
-                      id, old20, old21, reg_get(0x3820), reg_get(0x3821), reg_get(0x4514));
+    return send_jsonf("{\"id\":%d,\"ok\":true,\"old_3820\":%d,\"old_3821\":%d,\"new_3820\":%d,\"new_3821\":%d,"
+                      "\"old_4514\":%d,\"new_4514\":%d,\"old_4520\":%d,\"new_4520\":%d}",
+                      id, old20, old21, reg_get(0x3820), reg_get(0x3821),
+                      old4514, reg_get(0x4514), old4520, reg_get(0x4520));
 }
 
 // {"n":40}: grab n frames back to back WITHOUT sending them and return the
