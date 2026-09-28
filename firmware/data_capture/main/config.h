@@ -175,6 +175,14 @@
 #error "CONFIG_CAMERA_CAPTURE_FPS must be between 1 and 30"
 #endif
 
+// Default streaming resolution -- what camera_init() (camera.c) brings the sensor up in at
+// boot, and what a stream_* command with no explicit framesize keeps. A name
+// camera_parse_framesize() (camera.c SIZES[]) recognises. Reported over control_link.c's
+// get_status as "default_fps"/"default_framesize" so the host UI (software/host_server) can
+// seed its fps/resolution fields from this single compiled source instead of hardcoding its
+// own guess -- see docs/architecture.md.
+#define CONFIG_CAMERA_DEFAULT_FRAMESIZE "svga"
+
 #define CONFIG_CAMERA_QUEUE_LEN      5   // CONFIG_CAMERA_CAPTURE_FPS
 
 // Frame buffers backing the camera driver (PSRAM). Every frame sitting in

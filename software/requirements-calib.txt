@@ -1,3 +1,9 @@
 numpy
 opencv-contrib-python-headless
 pyserial
+# PyYAML: not imported directly by anything here, but rclpy (bag_recorder.py's ROS 2 bag
+# writer, only importable with /opt/ros/<distro>/setup.bash sourced first) needs it and the
+# venv has include-system-site-packages=false, so it can't fall back to the system copy --
+# without this, ros_available() is always False even with ROS 2 correctly installed and
+# sourced. See docs/camera_calibration_and_tuning.md.
+pyyaml

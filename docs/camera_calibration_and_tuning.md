@@ -30,8 +30,14 @@ streaming all go over the one control socket the device dials.
 ## Quick start
 
 ```bash
-# one-off: host tools need numpy + OpenCV
+# one-off: host tools need numpy + OpenCV (+ pyyaml, only actually exercised if you also
+# want ROS bag recording -- see docs/host_server_architecture.md "Recording")
 cd software && python3 -m venv .venv && .venv/bin/pip install -r requirements-calib.txt
+
+# optional, only for the "record to ROS bag" checkbox: source ROS 2 into this shell BEFORE
+# starting host_server below (a sourced-but-still-False ros_available is almost always the
+# venv missing PyYAML -- requirements-calib.txt above already covers it)
+# source /opt/ros/<distro>/setup.bash
 
 # firmware: build + flash (>= 45 s if using the flash_monitor wrapper, see docs/learnings.md)
 .claude/skills/esp32-idf/scripts/build.sh data_capture

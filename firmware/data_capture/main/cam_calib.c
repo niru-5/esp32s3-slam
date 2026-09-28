@@ -4,6 +4,7 @@
 #include "esp_log.h"
 
 #include "camera.h"
+#include "camera_overrides.h"
 
 static const char *TAG = "CAMCAL";
 
@@ -16,6 +17,13 @@ esp_err_t cam_calib_enter_mode(void) {
         ESP_LOGE(TAG, "camera bring-up for calibration failed (%s)", esp_err_to_name(err));
         return err;
     }
+    // Re-apply any NVS-persisted register overrides here too, same as
+    // camera_init_streaming() -- otherwise a calibration session starts from the
+    // driver's un-tuned defaults while streaming reflects the saved overrides
+    // (e.g. orientation), so the "current" picture in the calibration panel looks
+    // normal while a live stream looks flipped, and any register-diffing the
+    // console does starts from the wrong baseline.
+    camera_overrides_apply();
     strlcpy(s_fmt, "jpeg", sizeof(s_fmt));
     strlcpy(s_size, "svga", sizeof(s_size));
     ESP_LOGI(TAG, "-> calibration camera config (jpeg svga)");

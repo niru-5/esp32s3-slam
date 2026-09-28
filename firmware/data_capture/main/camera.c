@@ -106,7 +106,11 @@ esp_err_t camera_init_streaming(framesize_t size) {
 }
 
 esp_err_t camera_init(void) {
-    return camera_init_streaming(FRAMESIZE_SVGA);
+    framesize_t size = FRAMESIZE_SVGA;   // fallback if CONFIG_CAMERA_DEFAULT_FRAMESIZE is ever mistyped
+    if (!camera_parse_framesize(CONFIG_CAMERA_DEFAULT_FRAMESIZE, &size))
+        ESP_LOGE(TAG, "config.h CONFIG_CAMERA_DEFAULT_FRAMESIZE=\"%s\" is not a name camera_parse_framesize() "
+                      "recognises -- falling back to svga", CONFIG_CAMERA_DEFAULT_FRAMESIZE);
+    return camera_init_streaming(size);
 }
 
 void camera_release(camera_fb_t *fb) {

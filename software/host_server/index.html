@@ -29,6 +29,8 @@
   button.danger:hover { background: #3b1f24; border-color: #ff8080; }
   button:disabled { opacity: .35; cursor: default; }
   button.sm { padding: 4px 9px; font-size: 12px; }
+  button.info { padding: 2px 7px; font-size: 11px; border-radius: 999px; margin-left: 2px; }
+  .stepbtn { display: inline-flex; align-items: center; }
   input[type=text], input[type=number], select {
     background: #1b1e22; color: #e6e8eb; border: 1px solid #33373d; border-radius: 5px;
     padding: 6px 8px; font-size: 13px; }
@@ -74,8 +76,9 @@
     <div class="panel">
       <h2>Mode</h2>
       <div class="row">
-        <button id="mode-stream">Streaming</button>
+        <button id="mode-stream">Stream</button>
         <button id="mode-calib">Calibration</button>
+        <span class="muted" id="mode-stream-hint" style="display:none">(exit calibration mode first)</span>
       </div>
 
       <!-- ===================== Streaming ===================== -->
@@ -87,16 +90,16 @@
           <button id="sink-idle">Stop</button>
         </div>
         <div class="row">
-          <label class="field">fps <input type="number" id="fps" min="1" max="30" value="25"></label>
+          <label class="field">fps <input type="number" id="fps" min="1" max="30" placeholder="…"></label>
           <label class="field">resolution
             <select id="framesize">
               <option value="">(unchanged)</option>
-              <option value="qqvga">qqvga</option><option value="qvga">qvga</option>
-              <option value="cif">cif</option><option value="vga">vga</option>
-              <option value="svga" selected>svga</option><option value="xga">xga</option>
-              <option value="hd">hd</option><option value="sxga">sxga</option>
-              <option value="uxga">uxga</option><option value="fhd">fhd</option>
-              <option value="qxga">qxga</option><option value="5mp">5mp</option>
+              <option value="qqvga">160×120</option><option value="qvga">320×240</option>
+              <option value="cif">400×296</option><option value="vga">640×480</option>
+              <option value="svga">800×600</option><option value="xga">1024×768</option>
+              <option value="hd">1280×720</option><option value="sxga">1280×1024</option>
+              <option value="uxga">1600×1200</option><option value="fhd">1920×1080</option>
+              <option value="qxga">2048×1536</option><option value="5mp">2592×1944</option>
             </select>
           </label>
           <label class="check"><input type="checkbox" id="include_imu"> include IMU</label>
@@ -115,6 +118,13 @@
         <div class="row">
           <button id="target-camera">Camera</button>
           <button id="target-imu">IMU</button>
+          <button id="exit-calibration" class="danger" style="margin-left:auto">Exit calibration mode</button>
+        </div>
+        <div class="muted" style="margin-bottom:10px">
+          You're now controlling the camera directly — streaming is paused until you leave.
+          Click "Exit calibration mode" when you're done to hand the sensor back to normal
+          streaming config — don't just switch tabs, since anything mid-run (a
+          <code>tune</code> step, an intrinsics capture) needs a clean stop first.
         </div>
 
         <div id="camera-sub" style="display:none">
@@ -137,9 +147,30 @@
               <button id="save-status" class="sm">Save status</button>
               <button id="save-clear" class="sm">Clear saved</button>
             </div>
-            <div class="muted" style="margin-bottom:8px">ISP tuning steps (each backs up registers,
-              asks you to set up the scene, applies variants, reports before/after):</div>
+
+            <div class="muted" style="margin-bottom:8px">
+              <b>ISP tuning</b> — pick a step below. Each one backs up the registers, tells you
+              (in the console) how to physically set up the scene for that step, waits for you
+              to press Enter down there once you're ready, then applies its variants and
+              reports before/after. Click the <code>ⓘ</code> next to a step for its exact setup
+              instructions — they print into the Console below (scroll down) — before running
+              it. Steps are order-dependent (each assumes the earlier ones are already
+              correct), so work top to bottom left to right.
+            </div>
             <div class="steps" id="tune-steps"></div>
+
+            <div class="muted" style="margin:10px 0 8px">
+              <b>Intrinsic calibration</b> (checkerboard) — print a board with
+              <code>host_server.calibration make-board</code> first (see the docs). Click
+              <b>cal auto 20</b>, then slowly move the board through the camera's view —
+              tilt it, cover every corner of the frame — the console logs each accepted view
+              as it's found (a rejected one — blurry, board cut off, too similar to an
+              existing view — just doesn't count; keep moving); it stops itself at 20. Once
+              you have 15+ good views (check
+              <b>cal status</b> for coverage), click <b>cal solve --save</b> to fit the
+              intrinsics and write the result files. Re-run <b>cal auto 20</b> any time to add
+              more views before solving.
+            </div>
             <div class="row">
               <button id="cal-auto" class="sm">cal auto 20</button>
               <button id="cal-solve" class="sm">cal solve --save</button>
@@ -185,7 +216,7 @@
       <div class="stat"><span>PSRAM free</span><b id="psram">–</b></div>
       <div class="stat"><span>IMU</span><b id="imu_avail">–</b></div>
     </div>
-    <div class="panel">
+    <div class="panel" id="stream-stats-panel" style="display:none">
       <h2>Stream</h2>
       <div class="stat"><span>Frames</span><b id="frame_count">0</b></div>
       <div class="stat"><span>Frame rate</span><b id="frame_fps">0</b> fps</div>
@@ -228,16 +259,56 @@ function setCpu(pctId, barId, pct) {
 }
 
 // ---- Mode / streaming ----
+const streamStatsPanel = document.getElementById("stream-stats-panel");
+let anyModeChosen = false;
 document.getElementById("mode-stream").onclick = () => {
+  if (document.getElementById("mode-stream").disabled) return;   // mid-calibration -- see setCalibrationActive()
+  anyModeChosen = true;
   document.getElementById("stream-panel").style.display = "block";
   document.getElementById("calib-panel").style.display = "none";
+  streamStatsPanel.style.display = "block";
   setActive(["mode-stream", "mode-calib"], "mode-stream");
 };
 document.getElementById("mode-calib").onclick = () => {
+  anyModeChosen = true;
   document.getElementById("stream-panel").style.display = "none";
   document.getElementById("calib-panel").style.display = "block";
+  streamStatsPanel.style.display = "none";
   setActive(["mode-stream", "mode-calib"], "mode-calib");
 };
+// A page load/refresh while the device is already mid-calibration (from an earlier browser
+// tab, or serial) otherwise leaves this browser showing neither panel with no clue why --
+// sync the view to reality once, without touching the console/image state a real session
+// already has (resetCalibrationUI() is only for freshly *starting* one, see target-camera).
+function autoSyncModeOnce(devState) {
+  if (anyModeChosen || !devState) return;
+  anyModeChosen = true;
+  if (devState === "camera_calibration" || devState === "imu_calibration") {
+    document.getElementById("mode-calib").click();
+    const target = devState === "camera_calibration" ? "target-camera" : "target-imu";
+    document.getElementById(target === "target-camera" ? "camera-sub" : "imu-sub").style.display = "block";
+    setActive(["target-camera", "target-imu"], target);
+    if (target === "target-camera") setCalibLoading(false);
+  } else {
+    document.getElementById("mode-stream").click();
+  }
+}
+
+// Seed fps/resolution from the device's own compiled defaults (config.h
+// CONFIG_CAMERA_CAPTURE_FPS / CONFIG_CAMERA_DEFAULT_FRAMESIZE, reported over
+// get_status) the first time we see them, instead of a value hardcoded here that
+// can silently drift from what the firmware actually does. Only once -- after
+// that the operator may have deliberately typed/selected something else, and a
+// later poll must not stomp on it.
+let defaultsSeeded = false;
+function seedStreamDefaults(dev) {
+  if (defaultsSeeded || !dev || dev.default_fps === undefined) return;
+  document.getElementById("fps").value = dev.default_fps;
+  const sel = document.getElementById("framesize");
+  if ([...sel.options].some(o => o.value === dev.default_framesize))
+    sel.value = dev.default_framesize;
+  defaultsSeeded = true;
+}
 function streamParams() {
   return {
     fps: Number(document.getElementById("fps").value) || 0,
@@ -270,11 +341,25 @@ function setCalibLoading(loading) {
   document.getElementById("camera-loading").style.display = loading ? "block" : "none";
   document.getElementById("camera-controls").classList.toggle("loading", loading);
 }
+// Wipe every trace of a previous camera-calibration session from the browser before
+// starting a fresh one -- console log, image versions/src, tune-step highlighting. Without
+// this a re-entered session showed the *previous* session's console output and pictures
+// until enough new events arrived to overwrite them, which reads as "nothing was cleared".
+function resetCalibrationUI() {
+  document.getElementById("console").innerHTML = "";
+  consoleSince = 0;
+  waitingForAnswer = false;
+  lastLiveVersion = -1;
+  lastBeforeVersion = -1;
+  document.getElementById("calib_img").src = PLACEHOLDER_IMG;
+  document.getElementById("calib_before_img").src = PLACEHOLDER_IMG;
+  setCalibLoading(true);
+}
 document.getElementById("target-camera").onclick = () => {
   document.getElementById("camera-sub").style.display = "block";
   document.getElementById("imu-sub").style.display = "none";
   setActive(["target-camera", "target-imu"], "target-camera");
-  setCalibLoading(true);
+  resetCalibrationUI();
   post("set_state", {state: "camera_calibration"});
 };
 document.getElementById("target-imu").onclick = () => {
@@ -286,6 +371,30 @@ document.getElementById("target-imu").onclick = () => {
 for (const btn of document.querySelectorAll("#imu-prompt [data-axis]"))
   btn.onclick = () => post("imu_cal_axis", {axis: Number(btn.dataset.axis)});
 document.getElementById("imu-abort").onclick = () => post("imu_cal_abort");
+
+// Explicit, deliberate way out of calibration mode -- goes through the same set_state path
+// (not the raw "exit" device command) so the host's CalibrationManager tears the console
+// down *before* the device is told to change state (see app.py Server._set_state's ordering
+// note), same as switching straight to a stream sink would. Also resets this browser's own
+// calibration UI immediately rather than waiting for the next poll to notice.
+document.getElementById("exit-calibration").onclick = () => {
+  post("set_state", {state: "idle"});
+  setActive(["target-camera", "target-imu"], null);
+  document.getElementById("camera-sub").style.display = "none";
+  document.getElementById("imu-sub").style.display = "none";
+  resetCalibrationUI();
+};
+
+// The device can only run one thing at a time, and switching to Stream mid-calibration
+// without an explicit exit is how a `tune`/`cal` step used to get orphaned (see
+// docs/host_server_architecture.md "no graceful exit"). Disable the way out other than the
+// Exit button while camera_calibration is actually active on the device -- driven off
+// get_status in poll(), not just this browser's own clicks, so it also reacts to
+// calibration entered/left via serial or another browser tab.
+function setCalibrationActive(active) {
+  document.getElementById("mode-stream").disabled = active;
+  document.getElementById("mode-stream-hint").style.display = active ? "inline" : "none";
+}
 
 // ---- Calibration console ----
 let consoleSince = 0;
@@ -322,10 +431,22 @@ document.getElementById("cal-status").onclick = () => sendLine("cal status");
 
 const stepsDiv = document.getElementById("tune-steps");
 for (const step of TUNE_STEPS) {
+  const wrap = document.createElement("span");
+  wrap.className = "stepbtn";
   const run = document.createElement("button");
   run.className = "sm"; run.textContent = step;
+  run.title = `Run this step now — check the notes (ⓘ) first if you haven't set this scene up before.`;
   run.onclick = () => sendLine(`tune ${step} --yes`);
-  stepsDiv.appendChild(run);
+  // Reuses the device/session's own `tune notes <step>` command (cli.py) rather than a
+  // second copy of the setup text here -- prints the exact same physical-setup instructions
+  // and expected result into the console below, so this can't drift from what `tune` itself
+  // actually does.
+  const info = document.createElement("button");
+  info.className = "sm info"; info.textContent = "ⓘ";
+  info.title = `What "${step}" needs and expects`;
+  info.onclick = () => sendLine(`tune notes ${step}`);
+  wrap.appendChild(run); wrap.appendChild(info);
+  stepsDiv.appendChild(wrap);
 }
 
 // Data-URI placeholder shown until a real image exists (version 0) -- an empty-body
@@ -396,6 +517,9 @@ async function poll() {
     const dev = (j.device && j.device.get_status) || {};
     document.getElementById("state").textContent = STATE_NAMES[dev.state] || dev.state || "–";
     document.getElementById("state_lbl").textContent = dev.state ? ("(" + dev.state + ")") : "";
+    seedStreamDefaults(dev);
+    setCalibrationActive(dev.state === "camera_calibration");
+    autoSyncModeOnce(dev.state);
     document.getElementById("uptime").textContent = dev.uptime_us ? (dev.uptime_us / 1e6).toFixed(0) + " s" : "–";
     document.getElementById("heap").textContent = kib(dev.heap_free);
     document.getElementById("psram").textContent = kib(dev.psram_free);

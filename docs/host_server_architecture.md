@@ -212,6 +212,62 @@ Four issues reported from actually using the browser page, each traced to a spec
    `imu_available`) so the browser greys out the checkbox with a reason, and by showing the
    `set_recording` error immediately instead of waiting for the next poll to silently fix it.
 
+## Recent fixes (2026-09-28, UI/workflow review)
+
+Eight issues from a review of the browser page + firmware, tracked in
+`docs/ui_fixes_todo.md`:
+
+1. **Mode label.** "Streaming" → "Stream" (copy only, `index.html`).
+2. **fps/resolution defaults hardcoded in the browser.** `index.html` hardcoded `fps=25`/
+   `svga` independent of the firmware's actual compiled defaults
+   (`CONFIG_CAMERA_CAPTURE_FPS`/`CONFIG_CAMERA_DEFAULT_FRAMESIZE` in `config.h`). Fixed by
+   adding both to `get_status`'s reply (`control_link.c`) and having the browser seed its
+   fps/resolution fields from them on first load (`seedStreamDefaults()`) instead of a second,
+   driftable copy of the same numbers.
+3. **Resolution dropdown showed enum names, not pixel sizes.** `camera.c`'s `SIZES[]` was
+   already the curated "feasible" list (12 of `sensor.h`'s 24 `framesize_t` values); the
+   dropdown just needed pixel-dimension labels (`svga` → `800×600`, etc.) — the wire value
+   (`"svga"`) is unchanged.
+4. **ROS bag recording never worked despite ROS 2 being installed.** `software/.venv` has
+   `include-system-site-packages=false`; sourcing `/opt/ros/<distro>/setup.bash` only patches
+   `PYTHONPATH`, and the venv was still missing `PyYAML`, which `rclpy` imports — so
+   `rosbag2_py`'s import chain (and `ros_available()`) failed even with ROS 2 correctly
+   sourced. No sudo/apt install needed: `pip install pyyaml` into the venv fixed it; added to
+   `requirements-calib.txt`.
+5. **Stream stats box showed in Calibration mode too.** The right column's "Stream" panel had
+   no mode gating. Gave it an id and hid/showed it alongside the Stream/Calibration panel
+   toggle.
+6. **No graceful exit from calibration mode, stale UI on re-entry.** Two related gaps beyond
+   the 2026-09-27 round's close-ordering fix (#3 above, which only fixed the console's
+   internal race): there was no dedicated "leave calibration" affordance (switching to Stream
+   worked, but nothing stopped an operator from doing that mid-run without realizing it should
+   go through a clean exit), and the *browser's own* console/image state (`consoleSince`,
+   `lastLiveVersion`, etc.) was never reset between sessions, so re-entering calibration
+   showed the previous session's console log and pictures until new events overwrote them.
+   Fixed with an explicit "Exit calibration mode" button (`set_state idle`, same path as
+   switching to a stream sink), the Stream mode button disabled for the duration
+   (`setCalibrationActive()`, driven off `get_status`, so it also reacts to calibration
+   entered/left via serial or another tab), and `resetCalibrationUI()` wiping the console/
+   image state on every fresh entry and exit.
+7. **Streaming showed a flipped image; calibration's "current" picture looked normal.** Real
+   root cause, one level under the 2026-09-27 `RegisterBank.sync_orientation()` fix (which
+   made the *analysis* code correctly read whatever orientation registers actually hold — it
+   didn't touch what the hardware registers actually get set to): `cam_calib_enter_mode()`
+   (`cam_calib.c`) calls `camera_init_ex()` directly and never called
+   `camera_overrides_apply()`, unlike `camera_init_streaming()` (`camera.c`), which does. So
+   entering calibration left the sensor's *actual* registers at the driver's un-tuned
+   defaults — including orientation — while streaming reflected the saved NVS overrides. The
+   "current" picture was truthfully unflipped because the hardware genuinely was, at that
+   point, unflipped; only streaming re-applied the saved override. Fixed by calling
+   `camera_overrides_apply()` in `cam_calib_enter_mode()` too, so both paths start from the
+   same persisted register state.
+8. **No operator-facing guidance for the calibration workflow.** The technical detail already
+   existed in this doc and the tuning playbook, but nothing pointed at it from the UI itself.
+   Added: a short intro in the Calibration panel, a description of the intrinsics flow
+   (`cal auto 20` → `cal status` → `cal solve --save`) above those buttons, and a per-step
+   "ⓘ" button next to each `tune` step that runs `tune notes <step>` — reusing the session's
+   own notes command instead of a second copy of the setup text that could drift from it.
+
 ## HTTP routes
 
 ```

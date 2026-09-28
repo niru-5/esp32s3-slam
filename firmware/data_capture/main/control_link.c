@@ -142,12 +142,14 @@ static esp_err_t reply_err(int id, const char *msg) {
 
 static esp_err_t cmd_get_status(int id) {
     return send_jsonf("{\"id\":%d,\"ok\":true,\"state\":\"%s\",\"uptime_us\":%lld,"
-                      "\"heap_free\":%u,\"psram_free\":%u,\"imu_available\":%s}",
+                      "\"heap_free\":%u,\"psram_free\":%u,\"imu_available\":%s,"
+                      "\"default_fps\":%d,\"default_framesize\":\"%s\"}",
                       id, state_machine_state_name(state_machine_get_state()),
                       (long long)esp_timer_get_time(),
                       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                       (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-                      imu_available() ? "true" : "false");
+                      imu_available() ? "true" : "false",
+                      CONFIG_CAMERA_CAPTURE_FPS, CONFIG_CAMERA_DEFAULT_FRAMESIZE);
 }
 
 // "state" -> the same digit the serial console would send for it.
