@@ -170,7 +170,7 @@
 // Default fps when camera_pipeline_start(0) is called (serial commands, which have
 // no way to carry a runtime fps) -- streaming commands over the control channel can
 // request any fps 1-30 instead (see camera_pipeline_start()'s own clamping).
-#define CONFIG_CAMERA_CAPTURE_FPS      25
+#define CONFIG_CAMERA_CAPTURE_FPS      20
 #if CONFIG_CAMERA_CAPTURE_FPS < 1 || CONFIG_CAMERA_CAPTURE_FPS > 30
 #error "CONFIG_CAMERA_CAPTURE_FPS must be between 1 and 30"
 #endif
